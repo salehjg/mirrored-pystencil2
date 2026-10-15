@@ -100,6 +100,11 @@ def gen_config(request: pytest.FixtureRequest, target: ps.Target, jit: JitBase):
         if target == ps.Target.ARM_SVE:
             gen_config.cpu.vectorize.lanes = 2
 
+        if target == ps.Target.RISCV_RVV:
+            #   Scalable target: pin a lane count. The driver derives the assumed VLEN
+            #   as lanes * width(default_dtype), i.e. LMUL=1 for the default dtype.
+            gen_config.cpu.vectorize.lanes = 4
+
     return gen_config
 
 

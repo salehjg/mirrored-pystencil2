@@ -3,7 +3,7 @@ from typing import cast
 import sympy as sp
 
 from .target import Target
-from .config import CpuOptions
+from .config import CpuOptions, VectorizationMode
 from .errors import CodegenError
 
 from ..types import PsScalarType
@@ -57,11 +57,26 @@ class DefaultCpuLoopStrategies:
         enable_vec = vec_options.get_option("enable")
 
         vec_lanes: int | None = vec_options.get_option("lanes")
+        vec_mode: VectorizationMode = vec_options.get_option("mode")
+
+        #   VLA (stripmining) is only available on the RVV target.
+        is_vla = (
+            enable_vec
+            and self._target == Target.RISCV_RVV
+            and vec_mode == VectorizationMode.STRIPMINE
+        )
+        l_nom = sew = lmul = 0
 
         if enable_vec:
             self._apply_vectorization_assumptions()
 
-            if vec_lanes is None:
+            if is_vla:
+                rvv = self._cpu_options.rvv
+                sew = cast(PsScalarType, self._ctx.default_dtype).width
+                lmul = rvv.get_option("lmul") or 1
+                vlen = rvv.get_option("vlen") or 128
+                l_nom = vlen * lmul // sew
+            elif vec_lanes is None:
                 vec_lanes = self._target.default_vector_lanes(
                     cast(PsScalarType, self._ctx.default_dtype)
                 )
@@ -78,7 +93,34 @@ class DefaultCpuLoopStrategies:
 
         block_loops, parallelize = self._block_loop_expansions(ispace, ae)
 
-        if rank == 1 and enable_vec:
+        if rank == 1 and is_vla:
+            #   VLA: a single stripmined axis absorbs the tail. Under OpenMP, wrap it in
+            #   a fixed-size parallel block loop so the parallel loop stays canonical
+            #   (a stripmined loop's increment is not loop-invariant; D10).
+            if parallelize:
+                chunk = max(l_nom, 1) * 512  # coarse per-thread work unit
+                strategy = ae.create_strategy(
+                    block_loops
+                    + [
+                        [
+                            ae.parallel_block_loop(chunk, **omp_kwargs),
+                            ae.stripmine(l_nom, sew, lmul),
+                        ]
+                    ]
+                )
+            else:
+                strategy = ae.create_strategy(
+                    block_loops + [ae.stripmine(l_nom, sew, lmul)]
+                )
+        elif is_vla:
+            #   VLA, rank >= 2: parallelize an outer dimension; stripmine the innermost.
+            strategy = ae.create_strategy(
+                block_loops
+                + [ae.parallel_loop(**omp_kwargs) if parallelize else ae.loop()]
+                + [ae.loop() for _ in range(rank - 2)]
+                + [ae.stripmine(l_nom, sew, lmul)]
+            )
+        elif rank == 1 and enable_vec:
             assert vec_lanes is not None
             strategy = ae.create_strategy(
                 block_loops

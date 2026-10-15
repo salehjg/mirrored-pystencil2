@@ -72,8 +72,21 @@ class GenericCpu(Platform):
         return PsAssignment(ptr_access, rhs)
 
     def select_function(self, call: PsCall) -> PsExpression:
+        from ..functions import PsVecStripmineLanes
+        from ..ast.expressions import PsTernary, PsLe
+
         call_func = call.function
         assert isinstance(call_func, PsIrFunction)
+
+        if isinstance(call_func, PsVecStripmineLanes):
+            #   Host fallback: min(remaining, l_nom). Keeps stripmined loops
+            #   printable/executable on non-RVV platforms for VLA loop-shape tests.
+            r = call.args[0]
+            r_dtype = r.get_dtype()
+            l_nom = PsExpression.make(PsConstant(call_func.l_nom, r_dtype))
+            expr = PsTernary(PsLe(r.clone(), l_nom.clone()), r.clone(), l_nom.clone())
+            typify = Typifier(self._ctx)
+            return typify(expr)
 
         dtype = call.get_dtype()
         arg_types = (dtype,) * call.function.arg_count

@@ -33,6 +33,9 @@ def test_philox(dtype, gen_config, xp, offsets, c_value):
 
     target = gen_config.get_target()
 
+    if target == ps.Target.RISCV_RVV and dtype == "float64":
+        pytest.xfail("RVV f64 Philox RNG is deferred (design decision D13)")
+
     layout = "numpy" if target == ps.Target.SYCL else "fzyx"
     f, g = ps.fields(f"f({q}), g({q}): {dtype}[2D]", layout=layout)
 

@@ -240,12 +240,40 @@ class OpenMpOptions(ConfigBase):
     """Set the number of OpenMP threads to execute the parallel region."""
 
 
+class VectorizationMode(Enum):
+    """Code generation mode for scalable-vector targets (currently `Target.RISCV_RVV`)."""
+
+    FIXED = auto()
+    """Vector-length-specific (VLS): pin a fixed lane count at codegen time.
+
+    The generated kernel processes exactly ``lanes`` elements per vector operation and
+    strides the innermost loop by ``lanes``. This is the only mode fixed-width targets
+    (x86, NEON) and the SVE backend support, and the default for RVV.
+    """
+
+    STRIPMINE = auto()
+    """Vector-length-agnostic (VLA): stripmine the innermost loop.
+
+    Each inner-loop iteration asks the hardware how many elements it may process
+    (``vsetvl``) and advances by the granted count. The same binary runs correctly and
+    at full width for any ``VLEN`` at or above the configured floor. RVV only.
+    """
+
+
 @dataclass
 class VectorizationOptions(ConfigBase):
     """Configuration for the auto-vectorizer."""
 
     enable: BasicOption[bool] = BasicOption(False)
     """Enable intrinsic vectorization."""
+
+    mode: Option[VectorizationMode, str] = Option(VectorizationMode.FIXED)
+    """Vectorization mode for scalable-vector targets.
+
+    Only meaningful for `Target.RISCV_RVV`. Fixed-width targets and SVE always use
+    `VectorizationMode.FIXED`. Accepts either a `VectorizationMode` value or the
+    case-insensitive strings ``"fixed"``/``"vls"`` and ``"stripmine"``/``"vla"``.
+    """
 
     lanes: BasicOption[int] = BasicOption()
     """Number of SIMD lanes to be used in vectorization.
@@ -283,6 +311,50 @@ class VectorizationOptions(ConfigBase):
     that is not equal to one, an error will be raised.
     """
 
+    @mode.validate
+    def _validate_mode(self, val: str | VectorizationMode) -> VectorizationMode:
+        if isinstance(val, VectorizationMode):
+            return val
+
+        match str(val).lower():
+            case "fixed" | "vls":
+                return VectorizationMode.FIXED
+            case "stripmine" | "vla":
+                return VectorizationMode.STRIPMINE
+            case _:
+                raise ValueError(f"Invalid vectorization mode: {val}")
+
+
+@dataclass
+class RvvOptions(ConfigBase):
+    """Configuration options specific to the `Target.RISCV_RVV` target.
+
+    See the RVV backend documentation for the precise semantics. In short:
+
+    - In `VectorizationMode.FIXED` mode, ``vlen`` is the *assumed* hardware ``VLEN``,
+      and together with ``cpu.vectorize.lanes`` determines the per-type ``LMUL`` register
+      group. Both must be set.
+    - In `VectorizationMode.STRIPMINE` mode, ``vlen`` is the *minimum* (floor) ``VLEN``,
+      and together with ``lmul`` determines the nominal lane count for type bookkeeping.
+      ``cpu.vectorize.lanes`` must **not** be set.
+    """
+
+    vlen: BasicOption[int] = BasicOption()
+    """Assumed (FIXED mode) or minimum (STRIPMINE mode) vector register width ``VLEN``, in bits."""
+
+    check_vlen: BasicOption[bool] = BasicOption(True)
+    """Emit the kernel-entry runtime guard checking ``VLEN_hw >= vlen``.
+
+    Without this guard, a kernel built assuming ``vlen`` bits silently corrupts data when
+    run on hardware with a narrower ``VLEN``. Strongly recommended; on by default.
+    """
+
+    lmul: BasicOption[int] = BasicOption(1)
+    """STRIPMINE mode only: base ``LMUL`` for the kernel's default data type (default 1).
+
+    The nominal lane count is ``L_nom = vlen * lmul / width(default_dtype)``.
+    """
+
 
 @dataclass
 class CpuOptions(ConfigBase):
@@ -294,6 +366,10 @@ class CpuOptions(ConfigBase):
 
     vectorize: Category[VectorizationOptions] = Category(VectorizationOptions())
     """Options governing intrinsic vectorization.
+    """
+
+    rvv: Category[RvvOptions] = Category(RvvOptions())
+    """Options governing the RISC-V RVV backend. See `RvvOptions`.
     """
 
     loop_blocking: BasicOption[tuple[int | sp.Expr | None, ...]] = BasicOption()

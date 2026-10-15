@@ -120,6 +120,66 @@ class PsMathFunction(PsIrFunction):
         return hash(self._func)
 
 
+class PsVecStripmineLanes(PsIrFunction):
+    """Vector-length-agnostic stripmine step (RVV VLA mode, design decision D9).
+
+    Semantic contract: given a remaining iteration count ``r > 0`` and the kernel's
+    vector configuration, return a granted count ``g`` with ``1 <= g <= min(r, VLMAX)``,
+    such that repeated application terminates. This must *not* be modelled as
+    ``min(r, VLMAX)`` in general -- ``vsetvl`` may grant less in the transition band
+    ``VLMAX < r < 2*VLMAX`` -- but only the returned value is authoritative.
+
+    Platforms lower this function:
+
+    - `RvvCpu` -> ``__riscv_vsetvl_e{sew}m{lmul}(r)`` for the kernel's reference config.
+    - `GenericCpu` -> ``min(r, l_nom)`` so the IR stays printable/executable on any host
+      (used for VLA loop-shape unit tests without a RISC-V toolchain).
+
+    Args:
+        sew: Selected element width (bits) of the reference config (the default dtype).
+        lmul: The (integer) base LMUL of the reference config.
+        l_nom: Nominal lane count ``VLEN*LMUL/SEW`` used for the `GenericCpu` fallback.
+    """
+
+    __match_args__ = ("sew", "lmul", "l_nom")
+
+    def __init__(self, sew: int, lmul: int, l_nom: int) -> None:
+        super().__init__("vsetvl", 1)
+        self._sew = sew
+        self._lmul = lmul
+        self._l_nom = l_nom
+
+    @property
+    def sew(self) -> int:
+        return self._sew
+
+    @property
+    def lmul(self) -> int:
+        return self._lmul
+
+    @property
+    def l_nom(self) -> int:
+        return self._l_nom
+
+    def __str__(self) -> str:
+        return f"vsetvl_e{self._sew}m{self._lmul}"
+
+    def __repr__(self) -> str:
+        return f"PsVecStripmineLanes({self._sew}, {self._lmul}, {self._l_nom})"
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, PsVecStripmineLanes):
+            return False
+        return (self._sew, self._lmul, self._l_nom) == (
+            other._sew,
+            other._lmul,
+            other._l_nom,
+        )
+
+    def __hash__(self) -> int:
+        return hash((PsVecStripmineLanes, self._sew, self._lmul, self._l_nom))
+
+
 class PsReductionWriteBack(PsIrFunction):
     """Function representing a reduction kernel's write-back step supported by the backend.
 

@@ -16,14 +16,16 @@ from ..ast.axes import (
     PsGpuBlockXThreadAxis,
     GpuGridDimension,
 )
-from ..ast.structural import PsStructuralNode, PsBlock, PsDeclaration
-from ..ast.expressions import PsExpression
+from ..ast.structural import PsStructuralNode, PsBlock, PsDeclaration, PsAssignment
+from ..ast.expressions import PsExpression, PsCast
 from ..constants import PsConstant
+from ...types import PsUnsignedIntegerType
 from ..functions import (
     PsMathFunction,
     MathFunctions,
     PsGpuIndexingFunction,
     GpuGridScope,
+    PsVecStripmineLanes,
 )
 
 from .eliminate_constants import TypifyAndFold
@@ -362,6 +364,95 @@ class AxisExpansion:
             return PsSimdAxis(lanes, cube.ranges[0], cube.body)
 
         return ExpansionFunc(f"simd({lanes})", apply_simd)
+
+    def stripmine(self, l_nom: int, sew: int, lmul: int) -> ExpansionFunc:
+        """Vector-length-agnostic stripmining (RVV VLA mode, design decision D9).
+
+        Fuses a block-loop and a SIMD axis into a single stripmined loop:
+
+        .. code-block:: C
+
+            for (i = start; i < stop; i += vl_idx) {
+                vl     = vsetvl(stop - i);   // granted lane count, 1..VLMAX
+                vl_idx = (index_t) vl;
+                <vectorized body; every op takes vl>
+            }
+
+        The body is vectorized at the *nominal* lane count ``l_nom`` (for type/LMUL
+        bookkeeping); everything runtime-observable derives from ``vl`` (`PsVecStripmineLanes`).
+
+        Args:
+            l_nom: Nominal lane count (``VLEN*LMUL/SEW`` of the reference dtype).
+            sew: SEW of the reference (default) dtype, for the ``vsetvl`` config.
+            lmul: Base LMUL of the reference dtype.
+        """
+
+        def apply_stripmine(cube: PsAxesCube) -> PsStructuralNode:
+            if len(cube.ranges) != 1:
+                raise PsInternalCompilerError(
+                    "Cannot apply `stripmine` expansion to a cube with more than one axis"
+                )
+
+            my_range = cube.ranges[0]
+            scalar_ctr = my_range.counter  # vectorized by the inner SIMD axis
+            start = my_range.start
+            stop = my_range.stop
+            step = my_range.step
+
+            idx_dtype = self._ctx.index_dtype
+            size_t = PsUnsignedIntegerType(64)
+
+            #   Outer (stripmine) loop counter and the two vl symbols
+            i_symb = self._ctx.duplicate_symbol(scalar_ctr.symbol)
+            i = PsExpression.make(i_symb)
+            vl_symb = self._ctx.get_new_symbol("_rvv_vl", size_t)
+            vl_idx_symb = self._ctx.get_new_symbol("_rvv_vl_idx", idx_dtype)
+
+            #   The `vl`/`vl_idx` symbols are DECLARED before the loop and only ASSIGNED
+            #   inside its body. This is essential: the loop increment `i += vl_idx`
+            #   reads a value produced by the body, and `CanonicalizeSymbols` would
+            #   otherwise treat the increment's use as a re-use of a symbol whose
+            #   in-body declaration already ended its lifespan (reverse traversal),
+            #   duplicating it into a spurious kernel parameter.
+            vl_outer_decl = PsDeclaration(
+                PsExpression.make(vl_symb),
+                PsExpression.make(PsConstant(0, size_t)),
+            )
+            vl_idx_outer_decl = PsDeclaration(
+                PsExpression.make(vl_idx_symb),
+                PsExpression.make(PsConstant(0, idx_dtype)),
+            )
+
+            #   Inner SIMD axis over `l_nom` lanes, counting from the current `i`.
+            inner_stop = self._type_fold(
+                i.clone() + step.clone() * self._factory.parse_index(l_nom)
+            )
+            inner_range = PsAxisRange(scalar_ctr, i.clone(), inner_stop, step.clone())
+            simd_axis = PsSimdAxis(l_nom, inner_range, cube.body)
+
+            #   vl = vsetvl(stop - i);  vl_idx = (index_t) vl;
+            remaining = self._type_fold(PsCast(size_t, stop.clone() - i.clone()))
+            vl_assign = self._type_fold(
+                PsAssignment(
+                    PsExpression.make(vl_symb),
+                    PsVecStripmineLanes(sew, lmul, l_nom)(remaining),
+                )
+            )
+            vl_idx_assign = self._type_fold(
+                PsAssignment(
+                    PsExpression.make(vl_idx_symb),
+                    PsCast(idx_dtype, PsExpression.make(vl_symb)),
+                )
+            )
+
+            loop_body = PsBlock([vl_assign, vl_idx_assign, simd_axis])
+            outer_range = PsAxisRange(
+                i, start, stop, PsExpression.make(vl_idx_symb)
+            )
+            loop_axis = PsLoopAxis(outer_range, loop_body)
+            return PsBlock([vl_outer_decl, vl_idx_outer_decl, loop_axis])
+
+        return ExpansionFunc(f"stripmine({l_nom})", apply_stripmine)
 
     def _iteration_count(self, rang: PsAxisRange) -> PsExpression:
         extent = rang.stop - rang.start

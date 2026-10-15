@@ -21,6 +21,7 @@ from pystencils.backend.platforms import (
     X86VectorCpu,
     NeonCpu,
     SveCpu,
+    RvvCpu,
 )
 from pystencils.backend.ast.structural import PsBlock
 from pystencils.backend.transformations import AxisExpansion, MaterializeAxes, LowerToC
@@ -112,6 +113,15 @@ def get_setups(target: Target) -> list[VectorTestSetup]:
                 VectorTestSetup(target, SveCpu, 8, 16),
                 VectorTestSetup(target, SveCpu, 4, 32),
                 VectorTestSetup(target, SveCpu, 2, 64),
+            ]
+        case Target.RISCV_RVV:
+            #   Board profile (SpacemiT K1, VLEN=256): m1 and m2 configs for f32/f64.
+            rvv256 = partial(RvvCpu, vlen=256)
+            return [
+                VectorTestSetup(target, rvv256, 4, 64),   # f64/i64 -> m1
+                VectorTestSetup(target, rvv256, 8, 32),   # f32/i32 -> m1
+                VectorTestSetup(target, rvv256, 8, 64),   # f64/i64 -> m2
+                VectorTestSetup(target, rvv256, 16, 32),  # f32/i32 -> m2
             ]
         case _:
             return []
@@ -389,6 +399,9 @@ if Target.ARM_SVE in Target.available_vector_cpu_targets():
         VectorTestSetup(Target.ARM_SVE, SveCpu, 4, 32),
         VectorTestSetup(Target.ARM_SVE, SveCpu, 2, 64),
     ]
+
+if Target.RISCV_RVV in Target.available_vector_cpu_targets():
+    TEST_SETUPS_FOR_STRIDED_STORE += get_setups(Target.RISCV_RVV)
 
 
 @pytest.mark.parametrize(

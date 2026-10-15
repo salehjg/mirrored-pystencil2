@@ -424,6 +424,28 @@ class DefaultKernelCreationDriver:
                 from ..backend.platforms.sve import SveCpu
 
                 return SveCpu(self._ctx)
+            elif Target._RVV in self._target:
+                from ..backend.platforms.rvv import RvvCpu
+                from .config import VectorizationMode
+
+                vlen: int | None = self._cfg.cpu.rvv.get_option("vlen")
+                mode: VectorizationMode = self._cfg.cpu.vectorize.get_option("mode")
+                check_vlen: bool = self._cfg.cpu.rvv.get_option("check_vlen")
+                lanes: int | None = self._cfg.cpu.vectorize.get_option("lanes")
+
+                if vlen is None:
+                    #   Derive a sensible default: in FIXED mode with an explicit lane
+                    #   count, pick the VLEN that yields LMUL=1 for the default dtype
+                    #   (the recommended register-pressure sweet spot, plan section 6).
+                    #   Otherwise fall back to the RVV minimum VLEN of 128 bits.
+                    if mode == VectorizationMode.FIXED and lanes is not None:
+                        vlen = lanes * self._ctx.default_dtype.width
+                    else:
+                        vlen = 128
+
+                return RvvCpu(
+                    self._ctx, vlen=vlen, mode=mode, check_vlen=check_vlen
+                )
             elif self._target == Target.GenericCPU:
                 return GenericCpu(self._ctx)
             else:
