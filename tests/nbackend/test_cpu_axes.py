@@ -17,6 +17,7 @@ from pystencils.backend.platforms import (
     X86VectorArch,
     NeonCpu,
     SveCpu,
+    RvvCpu,
 )
 from pystencils.backend.ast.structural import PsBlock
 from pystencils.backend.transformations import (
@@ -53,6 +54,8 @@ def _make_kernel(
             platform = NeonCpu(ctx)
         case ps.Target.ARM_SVE:
             platform = SveCpu(ctx)
+        case ps.Target.RISCV_RVV:
+            platform = RvvCpu(ctx)
         case _:
             platform = GenericCpu(ctx)
 

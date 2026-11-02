@@ -38,6 +38,10 @@ def inspect_kernel(kernel: Kernel, gen_config: CreateKernelConfig):
         case Target.X86_AVX512:
             assert f"_mm512_loadu_{px}" in code
             assert f"_mm512_storeu_{px}" in code
+        case Target.RISCV_RVV:
+            bits = 64 if px == "pd" else 32
+            assert f"__riscv_vle{bits}_v_f{bits}m1" in code
+            assert f"__riscv_vse{bits}_v_f{bits}m1" in code
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])

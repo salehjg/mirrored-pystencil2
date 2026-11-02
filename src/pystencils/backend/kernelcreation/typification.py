@@ -60,7 +60,6 @@ from ..functions import (
     PsRngEngineFunction,
     PsGpuIntrinsicFunction,
     PsGpuIndexingFunction,
-    PsVecStripmineLanes,
 )
 from ..ast.util import determine_memory_object
 from ..exceptions import TypificationError
@@ -662,7 +661,7 @@ class Typifier:
 
             case PsCall(function, args):
                 match function:
-                    case PsMathFunction() | PsVecStripmineLanes():
+                    case PsMathFunction():
                         for arg in args:
                             self.visit_expr(arg, tc)
                         tc.infer_dtype(expr)

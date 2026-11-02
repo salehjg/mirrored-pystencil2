@@ -2,8 +2,6 @@ from .target import Target
 from .config import (
     CreateKernelConfig,
     AUTO,
-    VectorizationMode,
-    RvvOptions,
 )
 from .parameters import Parameter
 from .kernel import Kernel, GpuKernel
@@ -15,8 +13,6 @@ __all__ = [
     "Target",
     "CreateKernelConfig",
     "AUTO",
-    "VectorizationMode",
-    "RvvOptions",
     "Parameter",
     "Kernel",
     "GpuKernel",

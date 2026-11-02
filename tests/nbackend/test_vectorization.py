@@ -115,13 +115,12 @@ def get_setups(target: Target) -> list[VectorTestSetup]:
                 VectorTestSetup(target, SveCpu, 2, 64),
             ]
         case Target.RISCV_RVV:
-            #   Board profile (SpacemiT K1, VLEN=256): m1 and m2 configs for f32/f64.
-            rvv256 = partial(RvvCpu, vlen=256)
+            #   Same as AVX (VLEN = 256), minus 2 x 64bit: a 128-bit vector of 64-bit
+            #   elements would need the (nonexistent) fractional type `vfloat64mf2_t`.
             return [
-                VectorTestSetup(target, rvv256, 4, 64),   # f64/i64 -> m1
-                VectorTestSetup(target, rvv256, 8, 32),   # f32/i32 -> m1
-                VectorTestSetup(target, rvv256, 8, 64),   # f64/i64 -> m2
-                VectorTestSetup(target, rvv256, 16, 32),  # f32/i32 -> m2
+                VectorTestSetup(target, RvvCpu, 8, 32),
+                VectorTestSetup(target, RvvCpu, 4, 32),
+                VectorTestSetup(target, RvvCpu, 4, 64),
             ]
         case _:
             return []

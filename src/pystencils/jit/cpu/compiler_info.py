@@ -8,41 +8,26 @@ from typing import Sequence
 
 from ...codegen.target import Target
 
+#   The RVV backend hardcodes VLEN = 256 (SpacemiT K1). `zvl256b` tells the compiler
+#   the same thing (VLEN >= 256), and is what `pystencils_runtime/rvv.hpp` checks for.
+_RISCV_RVV_MARCH = "-march=rv64gcv_zvl256b"
 
-def _synthesize_riscv_march(isa: str | None) -> str | None:
-    """Build a GCC/Clang ``-march`` string from a RISC-V ``/proc/cpuinfo`` ISA string.
 
-    GCC does not accept ``-march=native`` on RISC-V, so we reconstruct the flag from
-    the reported ISA string. Two classes of multi-letter tokens are dropped, since they
-    do not affect the instructions the compiler emits for a compute kernel and are not
-    universally recognized by every toolchain version:
+def _current_cpu_march() -> list[str]:
+    """``-march`` flag for `Target.CurrentCPU`.
 
-    - vendor-specific extensions (prefix ``x``, e.g. ``xtheadvector``); and
-    - supervisor / hypervisor extensions (prefix ``s`` or ``h``, e.g. ``svadu``,
-      ``svpbmt``, ``sstc``) -- these control the MMU/privileged behaviour. Notably
-      QEMU advertises ``svadu`` in its emulated ISA string, which GCC 14 rejects.
-
-    Examples:
-        >>> _synthesize_riscv_march("rv64imafdcv_zicsr_zvl256b")
-        'rv64imafdcv_zicsr_zvl256b'
-        >>> _synthesize_riscv_march("rv64gc_xtheadvector_zba")
-        'rv64gc_zba'
-        >>> _synthesize_riscv_march("rv64imafdcv_zve64d_sstc_svadu")
-        'rv64imafdcv_zve64d'
-        >>> _synthesize_riscv_march(None) is None
-        True
+    GCC (at least up to 14) rejects ``-march=native`` on RISC-V, so on riscv64 hosts
+    we resolve the current CPU ourselves: the RVV flags if the V extension is present,
+    plain ``rv64gc`` otherwise. All other hosts use ``-march=native``.
     """
-    if not isa:
-        return None
+    import platform
 
-    tokens = isa.strip().lower().split("_")
-    if not tokens or not tokens[0].startswith(("rv32", "rv64", "rv128")):
-        return None
+    if platform.machine() == "riscv64":
+        if Target.RISCV_RVV in Target.available_vector_cpu_targets():
+            return [_RISCV_RVV_MARCH]
+        return ["-march=rv64gc"]
 
-    kept = [tokens[0]] + [
-        t for t in tokens[1:] if t and not t.startswith(("x", "s", "h"))
-    ]
-    return "_".join(kept)
+    return ["-march=native"]
 
 
 @dataclass
@@ -63,23 +48,9 @@ class CompilerInfo(ABC):
 
     The value of ``target`` is used to set the ``-march`` compiler
     option (or equivalent).
-    `Target.CurrentCPU` translates to ``-march=native`` on x86/ARM, and to an
-    ``-march=`` string synthesized from ``/proc/cpuinfo`` on RISC-V (where
-    ``-march=native`` is not accepted by GCC).
+    `Target.CurrentCPU` translates to ``-march=native``
+    (on RISC-V hosts, to an explicit ``-march`` string; see `_current_cpu_march`).
     """
-
-    rvv_vlen: int | None = None
-    """Assumed/minimum ``VLEN`` (bits) for a `Target.RISCV_RVV` build.
-
-    When set, ``_zvl{vlen}b`` is appended to the ``-march`` string. In fixed-length
-    (VLS) mode (see `rvv_fixed_length`) this additionally enables
-    ``-mrvv-vector-bits=zvl``, letting the compiler treat the scalable vector types as
-    fixed-size and optimize more aggressively.
-    """
-
-    rvv_fixed_length: bool = False
-    """If `True` and building for `Target.RISCV_RVV` with `rvv_vlen` set, pass
-    ``-mrvv-vector-bits=zvl`` (VLS mode only; must not be used for VLA kernels)."""
 
     extra_cxxflags: list[str] = field(default_factory=list)
 
@@ -157,7 +128,7 @@ class _GnuLikeCliCompiler(CompilerInfo):
 
         match self.target:
             case Target.CurrentCPU:
-                flags += self._current_cpu_march_flags()
+                flags += _current_cpu_march()
             case Target.X86_SSE:
                 flags += ["-march=x86-64-v2"]
             case Target.X86_AVX:
@@ -173,40 +144,9 @@ class _GnuLikeCliCompiler(CompilerInfo):
             case Target.ARM_SVE:
                 flags += ["-march=armv8.2-a+sve"]
             case Target.RISCV_RVV:
-                flags += self._riscv_rvv_march_flags()
+                flags += [_RISCV_RVV_MARCH]
 
         return flags + self.extra_cxxflags
-
-    def _current_cpu_march_flags(self) -> list[str]:
-        """``-march`` flags for `Target.CurrentCPU`.
-
-        On x86/ARM this is ``-march=native``. On RISC-V, GCC rejects
-        ``-march=native`` (`ISA string must begin with rv32 or rv64`), so we synthesize
-        an explicit ``-march=`` string from ``/proc/cpuinfo``, dropping vendor-specific
-        (``x*``) extension tokens the compiler may not recognize.
-        """
-        import platform
-
-        if platform.machine() in ("riscv64", "riscv"):
-            from ...codegen.target import _query_riscv_isa_string
-
-            march = _synthesize_riscv_march(_query_riscv_isa_string())
-            if march is not None:
-                return [f"-march={march}"]
-            #   Fall back to a conservative RVV-capable baseline
-            return ["-march=rv64gcv"]
-
-        return ["-march=native"]
-
-    def _riscv_rvv_march_flags(self) -> list[str]:
-        """``-march`` (and vector-bits) flags for an explicit `Target.RISCV_RVV` build."""
-        march = "rv64gcv"
-        if self.rvv_vlen is not None:
-            march += f"_zvl{self.rvv_vlen}b"
-        flags = [f"-march={march}"]
-        if self.rvv_fixed_length and self.rvv_vlen is not None:
-            flags.append("-mrvv-vector-bits=zvl")
-        return flags
 
     def linker_flags(self) -> list[str]:
         return ["-shared"]

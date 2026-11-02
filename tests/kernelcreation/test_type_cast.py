@@ -64,6 +64,16 @@ if Target.ARM_NEON_FP16 in AVAILABLE_TARGETS:
         ]
     ]
 
+if Target.RISCV_RVV in AVAILABLE_TARGETS:
+    #   Signed integers and floats of 32/64 bit; the wider type sets the lane count, so
+    #   every conversion changes the element width by at most a factor of two.
+    TYPE_CAST_COMBINATIONS += [
+        (Target.RISCV_RVV, from_type, to_type)
+        for from_type, to_type in product(
+            [np.int32, np.int64, np.float32, np.float64], repeat=2
+        )
+    ]
+
 if Target.ARM_SVE in AVAILABLE_TARGETS:
     TYPE_CAST_COMBINATIONS += [
         (Target.ARM_SVE, from_type, to_type)

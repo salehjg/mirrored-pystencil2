@@ -86,14 +86,9 @@ class Target(Flag):
     RISCV_RVV = _CPU | _VECTOR | _RISCV | _RVV
     """RISC-V architecture with the ratified V vector extension (RVV 1.0).
 
-    Like `ARM_SVE`, this is a *scalable* vector target: the number of lanes is not
-    fixed by the ISA but read from a hardware CSR at runtime. Two code generation
-    modes are available via ``cpu.vectorize.mode`` (see `VectorizationMode`):
-
-    - ``FIXED`` (VLS): the user pins ``cpu.vectorize.lanes`` and ``cpu.rvv.vlen``,
-      and codegen emits intrinsics processing exactly that many elements per op.
-    - ``STRIPMINE`` (VLA): the kernel is correct and fully utilizes the hardware for
-      any ``VLEN`` at or above the configured floor ``cpu.rvv.vlen``.
+    Treated like a fixed-width target (cf. `X86_AVX`): the code generator assumes a
+    hardware vector register width of exactly ``VLEN = 256`` bits (SpacemiT K1) and
+    emits vector-length-specific (VLS) code. Kernels require hardware with VLEN >= 256.
     """
 
     CurrentGPU = _GPU | _AUTOMATIC
@@ -157,18 +152,14 @@ class Target(Flag):
         match self:
             case Target.X86_SSE | Target.ARM_NEON | Target.ARM_NEON_FP16:
                 return 128 // (dtype.itemsize * 8)
-            case Target.X86_AVX:
+            case Target.X86_AVX | Target.RISCV_RVV:
+                #   RVV: VLEN is hardcoded to 256 bits, so lanes == one full register (LMUL=1)
                 return 256 // (dtype.itemsize * 8)
             case Target.X86_AVX512 | Target.X86_AVX512_FP16:
                 return 512 // (dtype.itemsize * 8)
             case Target.ARM_SVE:
                 raise CodegenError(
                     "Number of lanes for scalable vectors of the SVE architecture must be specified manually"
-                )
-            case Target.RISCV_RVV:
-                raise CodegenError(
-                    "Number of lanes for scalable vectors of the RVV architecture must be specified manually "
-                    "(VLS mode), or is derived by the loop strategy from (vlen, lmul) (VLA mode)."
                 )
             case _:
                 raise NotImplementedError(
@@ -290,8 +281,8 @@ def _available_vector_targets() -> tuple[Target, ...]:
             warn(
                 f"Unable to determine ARM architecture features on system {platform.system()}"
             )
-    elif machine_spec in ["riscv64", "riscv"]:
-        if _riscv_isa_string_has_rvv(_query_riscv_isa_string()):
+    elif machine_spec == "riscv64":
+        if _riscv_has_rvv():
             targets.append(Target.RISCV_RVV)
     else:
         warn(
@@ -303,71 +294,31 @@ def _available_vector_targets() -> tuple[Target, ...]:
     return tuple(targets)
 
 
-def _query_riscv_isa_string() -> str | None:
-    """Read the RISC-V ISA string of the current machine.
+def _riscv_has_rvv(cpuinfo: str | None = None) -> bool:
+    """Check whether this RISC-V machine implements the V extension (RVV 1.0).
 
-    Probes ``/proc/cpuinfo`` first (the ``isa`` line), falling back to the
-    device-tree entry ``/proc/device-tree/cpus/cpu@0/riscv,isa``. Returns the
-    raw ISA string (e.g. ``rv64imafdcv_zicsr_...``) or ``None`` if unavailable.
+    Linux reports the ISA string in ``/proc/cpuinfo`` (``isa : rv64imafdcv_zicsr_...``).
+    RVV 1.0 shows up as the single-letter extension ``v`` in the leading part before
+    the first ``_``. Multi-letter tokens such as ``_zve64d`` or ``_xtheadvector``
+    (the RVV 0.7 draft) must not count, hence we only look at that leading part.
+
+    Args:
+        cpuinfo: Text of ``/proc/cpuinfo``; read from the system if `None` (testing hook).
     """
-    import re as _re
+    if cpuinfo is None:
+        try:
+            with open("/proc/cpuinfo") as f:
+                cpuinfo = f.read()
+        except OSError:
+            return False
 
-    try:
-        with open("/proc/cpuinfo", "r") as f:
-            for line in f:
-                m = _re.match(r"\s*isa\s*:\s*(\S+)", line)
-                if m:
-                    return m.group(1)
-    except OSError:
-        pass
+    for line in cpuinfo.splitlines():
+        key, _, value = line.partition(":")
+        if key.strip() == "isa":
+            base = value.strip().lower().split("_")[0]  # e.g. "rv64imafdcv"
+            return base.startswith("rv") and "v" in base[4:]  # skip "rv64"/"rv32"
 
-    try:
-        #   device-tree strings are NUL-terminated
-        with open(
-            "/proc/device-tree/cpus/cpu@0/riscv,isa", "rb"
-        ) as f:
-            return f.read().rstrip(b"\x00").decode("ascii", errors="ignore")
-    except OSError:
-        pass
-
-    return None
-
-
-def _riscv_isa_string_has_rvv(isa: str | None) -> bool:
-    """Determine whether a RISC-V ISA string advertises the ratified V (RVV 1.0) extension.
-
-    The single-letter ``v`` extension in the base ISA segment (the part before the
-    first ``_``-separated multi-letter extension) indicates RVV 1.0. Care is taken
-    *not* to match multi-letter tokens that merely contain the letter ``v``, such as
-    ``_zvl256b``, ``_zve64d`` or ``_xtheadvector`` (the latter being the T-Head RVV
-    0.7 draft, which this backend deliberately does not support).
-
-    Examples:
-        >>> _riscv_isa_string_has_rvv("rv64imafdcv_zicsr_zvl256b")
-        True
-        >>> _riscv_isa_string_has_rvv("rv64gcv")
-        True
-        >>> _riscv_isa_string_has_rvv("rv64gc_xtheadvector")
-        False
-        >>> _riscv_isa_string_has_rvv("rv64imafdc_zve64d")
-        False
-        >>> _riscv_isa_string_has_rvv(None)
-        False
-    """
-    import re as _re
-
-    if not isa:
-        return False
-
-    isa = isa.strip().lower()
-    m = _re.match(r"rv(?:32|64|128)([a-z]*)", isa)
-    if not m:
-        return False
-
-    single_letter_exts = m.group(1)
-    #   'g' is shorthand for imafd(+zicsr+zifencei) and never implies 'v';
-    #   the vector extension only ever appears as a standalone single-letter 'v'.
-    return "v" in single_letter_exts
+    return False
 
 
 def _darwin_query_cpu_feature(feature: bytes) -> bool:

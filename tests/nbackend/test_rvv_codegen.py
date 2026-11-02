@@ -1,472 +1,319 @@
-"""WP2 codegen tests for the RVV VLS backend.
+"""Code generation tests for the RVV platform (VLS, VLEN = 256).
 
-These generate C code for ``Target.RISCV_RVV`` and assert on the emitted intrinsic
-names / types. They exercise the *entire* driver (loop strategy, materialization,
-intrinsic selection, lowering) but stop before compilation, so they run on any host
-with no RISC-V toolchain.
+These only generate code and inspect it, so they run on any host. The last test
+additionally compiles the generated code with a RISC-V compiler, if one is available
+(the native `g++` on a riscv64 host, or the `riscv64-linux-gnu-g++` cross compiler),
+which catches misspelled intrinsics without having to run anything.
 """
 
-import re
+import platform
+import shutil
+import subprocess
+
+import numpy as np
 import pytest
 import sympy as sp
 
 import pystencils as ps
-from pystencils import (
-    Target,
-    CreateKernelConfig,
-    create_kernel,
-    fields,
-    Assignment,
-    tcast,
-)
+from pystencils import Target, Assignment, TypedSymbol, DynamicType, fields
 from pystencils.backend.exceptions import MaterializationError
+from pystencils.backend.platforms.rvv import _rvv_type
 from pystencils.sympyextensions import ReductionOp, reduction_assignment
+from pystencils.sympyextensions.typed_sympy import tcast
+from pystencils.types import PsVectorType
+from pystencils.types.quick import Fp, SInt, UInt
 
 
-def rvv_c_code(
-    assignments,
-    *,
-    vlen,
-    lanes,
-    default_dtype="float64",
-    index_dtype="int64",
-    mode="fixed",
-    check_vlen=True,
-    assume_inner_stride_one=True,
-):
-    cfg = CreateKernelConfig()
-    cfg.target = Target.RISCV_RVV
-    cfg.default_dtype = default_dtype
-    cfg.index_dtype = index_dtype
+def rvv_config(default_dtype="float64", **kwargs) -> ps.CreateKernelConfig:
+    """Vectorized RVV config; lanes default to one full 256-bit register (like AVX)."""
+    cfg = ps.CreateKernelConfig(target=Target.RISCV_RVV, default_dtype=default_dtype, **kwargs)
     cfg.cpu.vectorize.enable = True
-    cfg.cpu.vectorize.lanes = lanes
-    cfg.cpu.vectorize.mode = mode
-    cfg.cpu.vectorize.assume_inner_stride_one = assume_inner_stride_one
-    cfg.cpu.rvv.vlen = vlen
-    cfg.cpu.rvv.check_vlen = check_vlen
-    return create_kernel(assignments, cfg).get_c_code()
-
-
-#   ---- LMUL derivation (design decision D2) ------------------------------------
-
-
-@pytest.mark.parametrize(
-    "dtype, lanes, vlen, expected_lmul",
-    [
-        ("float64", 4, 256, "m1"),
-        ("float64", 8, 256, "m2"),
-        ("float64", 2, 128, "m1"),
-        ("float32", 8, 256, "m1"),
-        ("float32", 16, 256, "m2"),
-        ("float32", 4, 256, "mf2"),
-        ("int64", 4, 256, "m1"),
-        ("int32", 8, 256, "m1"),
-    ],
-)
-def test_lmul_type_derivation(dtype, lanes, vlen, expected_lmul):
-    #   Two distinct source fields so the add is not folded into a scalar multiply.
-    a, b, g = fields(f"a, b, g: {dtype}[2D]", layout="fzyx")
-    code = rvv_c_code(
-        [Assignment(g.center(), a.center() + b.center())],
-        vlen=vlen,
-        lanes=lanes,
-        default_dtype=dtype,
-        index_dtype="int64" if "64" in dtype else "int32",
-    )
-    char = {"float64": "f64", "float32": "f32", "int64": "i64", "int32": "i32"}[dtype]
-    w = int(re.search(r"\d+", dtype).group())
-    #   The LMUL suffix is encoded in the intrinsic names.
-    add = "vfadd" if "float" in dtype else "vadd"
-    assert f"__riscv_{add}_vv_{char}{expected_lmul}" in code
-    assert f"__riscv_vle{w}_v_{char}{expected_lmul}" in code
-
-
-def test_illegal_lmul_raises():
-    #   f64 x 8 at VLEN=512 -> LMUL = 8*64/512 = 1 (legal). Use x2 at vlen=256 -> mf... illegal for f64.
-    f, g = fields("f, g: float64[2D]", layout="fzyx")
-    with pytest.raises(MaterializationError):
-        #   2 lanes * 64 bit / 512 = 1/4 -> vfloat64mf4_t does not exist
-        rvv_c_code(
-            [Assignment(g.center(), f.center() + f.center())],
-            vlen=512,
-            lanes=2,
-            default_dtype="float64",
-        )
-
-
-#   ---- Core arithmetic + memory ------------------------------------------------
-
-
-def test_core_arith_and_memory_f64():
-    src, dst = fields("src(2), dst(4): float64[2D]", layout="fzyx")
-    x = sp.symbols("x_:4")
-    update = [
-        Assignment(x[0], src[0, 0](0) + src[0, 0](1)),
-        Assignment(x[1], src[0, 0](0) - src[0, 0](1)),
-        Assignment(x[2], src[0, 0](0) * src[0, 0](1)),
-        Assignment(x[3], src[0, 0](0) / src[0, 0](1)),
-        Assignment(dst.center(0), x[0]),
-        Assignment(dst.center(1), x[1]),
-        Assignment(dst.center(2), x[2]),
-        Assignment(dst.center(3), x[3]),
-    ]
-    code = rvv_c_code(update, vlen=256, lanes=4)
-
-    #   NOTE: sympy canonicalizes `a - b` -> `a + (-1)*b` (so the `-1` broadcast folds to
-    #   vfmul_vf under D14) and `a / b` -> `a * (1/b)` (so the reciprocal folds to
-    #   vfrdiv_vf). Subtraction/division correctness is covered by the on-board numeric
-    #   tests (WP4/WP5).
-    for stem in (
-        "__riscv_vfadd_vv_f64m1",  # x0 = src0 + src1
-        "__riscv_vfmul_vv_f64m1",  # x2 = src0 * src1
-        "__riscv_vfrdiv_vf_f64m1",  # x3 = src0 * (1/src1), reciprocal folded (D14)
-        "__riscv_vle64_v_f64m1",
-        "__riscv_vse64_v_f64m1",
-    ):
-        assert stem in code, f"missing {stem}"
-
-    #   VLS mode passes the literal lane count as the trailing vl argument
-    assert re.search(r"__riscv_vfadd_vv_f64m1\([^;]*,\s*4uLL\)", code)
-
-
-def test_vlen_guard_emitted_and_suppressible():
-    f, g = fields("f, g: float64[2D]", layout="fzyx")
-    asm = [Assignment(g.center(), 2 * f.center())]
-
-    code = rvv_c_code(asm, vlen=256, lanes=4)
-    assert "pystencils::runtime::rvv::require_vlen(256" in code
-
-    code_off = rvv_c_code(asm, vlen=256, lanes=4, check_vlen=False)
-    assert "require_vlen" not in code_off
-
-
-def test_broadcast_folds_to_scalar_op():
-    #   D14: a broadcast scalar operand folds into the .vf scalar-operand form, so NO
-    #   `vfmv_v_f` broadcast instruction remains (the scalar is read from the f-register).
-    f, g = fields("f, g: float64[2D]", layout="fzyx")
-    code = rvv_c_code([Assignment(g.center(), 2.0 * f.center())], vlen=256, lanes=4)
-    assert "__riscv_vfmul_vf_f64m1" in code
-    assert "__riscv_vfmv_v_f" not in code
-
-
-def test_broadcast_reverse_forms():
-    #   D14 reverse forms for the non-commutative cases (scalar on the left).
-    f, g = fields("f, g: float64[2D]", layout="fzyx")
-    code = rvv_c_code([Assignment(g.center(), (3.0 - f.center()))], vlen=256, lanes=4)
-    assert "__riscv_vfrsub_vf_f64m1" in code
-    code = rvv_c_code([Assignment(g.center(), 1.0 / f.center())], vlen=256, lanes=4)
-    assert "__riscv_vfrdiv_vf_f64m1" in code
-    assert "__riscv_vfmv_v_f" not in code
-
-
-#   ---- Counter / vid progression (design decision D5) --------------------------
-
-
-def test_counter_uses_vid():
-    from pystencils import DEFAULTS
-
-    f = fields("f(1): int64[1D]", layout="fzyx")
-    code = rvv_c_code(
-        [Assignment(f(0), DEFAULTS.spatial_counters[0])],
-        vlen=256,
-        lanes=4,
-        default_dtype="int64",
-        index_dtype="int64",
-    )
-    assert "__riscv_vid_v_u64m1" in code
-
-
-#   ---- Strided access (design decision D6) -------------------------------------
-
-
-def test_strided_load_uses_vlse():
-    from pystencils import DEFAULTS, FieldType
-
-    f = fields("f: float64[2D]", layout="fzyx")
-    g = fields("g: float64[2D]", layout="fzyx", field_type=FieldType.CUSTOM)
-    i, j = DEFAULTS.spatial_counters[:2]
-    update = [
-        Assignment(
-            f(),
-            g.absolute_access((3 * i + 0, j), ())
-            + g.absolute_access((3 * i + 1, j), ()),
-        )
-    ]
-    code = rvv_c_code(update, vlen=256, lanes=4)
-    assert "__riscv_vlse64_v_f64m1" in code
-
-
-#   ---- Reductions (design decision D7) -----------------------------------------
-
-
-@pytest.mark.parametrize(
-    "op, redop",
-    [
-        (ReductionOp.Add, "vfredosum"),
-        (ReductionOp.Min, "vfredmin"),
-        (ReductionOp.Max, "vfredmax"),
-    ],
-)
-def test_float_reduction_intrinsics(op, redop):
-    x = ps.fields("x: float64[1D]")
-    w = ps.TypedSymbol("w", "float64")
-    red = reduction_assignment(w, op, x.center())
-
-    cfg = CreateKernelConfig()
-    cfg.target = Target.RISCV_RVV
-    cfg.default_dtype = "float64"
-    cfg.cpu.vectorize.enable = True
-    cfg.cpu.vectorize.lanes = 4
-    cfg.cpu.rvv.vlen = 256
-    code = create_kernel([red], cfg).get_c_code()
-
-    assert f"__riscv_{redop}_vs_f64m1_f64m1" in code
-    assert "__riscv_vfmv_s_f_f64m1" in code
-    assert "__riscv_vfmv_f_s_f64m1_f64" in code
-
-
-def test_reduction_accumulator_not_broadcast_folded():
-    """Regression: the reduction accumulator is declared as a broadcast of its identity
-    but is *reassigned* each iteration, so D14 must NOT fold its uses into a `.vf` form
-    (which would drop the accumulation). The in-loop update must stay `.vv`."""
-    x = ps.fields("x: float64[1D]")
-    w = ps.TypedSymbol("w", "float64")
-    red = reduction_assignment(w, ReductionOp.Add, x.center())
-    cfg = CreateKernelConfig()
-    cfg.target = Target.RISCV_RVV
-    cfg.default_dtype = "float64"
-    cfg.cpu.vectorize.enable = True
-    cfg.cpu.vectorize.lanes = 4
-    cfg.cpu.rvv.vlen = 256
-    code = create_kernel([red], cfg).get_c_code()
-    #   accumulator update stays vector-vector; no vfadd_vf-with-identity fold
-    assert "__riscv_vfadd_vv_f64m1" in code
-
-
-#   ---- VLA / stripmining (design decision D9) ----------------------------------
-
-
-def test_vla_loop_shape():
-    a, b, g = fields("a, b, g: float64[2D]", layout="c")
-    code = rvv_c_code(
-        [Assignment(g.center(), a.center() + b.center())],
-        vlen=256,
-        lanes=None,
-        mode="vla",
-    )
-    #   stripmine loop: vsetvl + advance by the granted count, no peel/remainder loop
-    assert "__riscv_vsetvl_e64m1" in code
-    assert "_rvv_vl_idx" in code
-    assert "+= _rvv_vl_idx" in code
-    #   every vectorized op takes the granted vl, not a literal
-    assert "__riscv_vfadd_vv_f64m1(" in code
-    assert "_rvv_vl)" in code
-    #   the granted-count symbol must NOT leak into the kernel signature
-    signature = code.split("{", 1)[0]
-    assert "_rvv_vl" not in signature
-
-
-def test_vla_lmul_from_config():
-    #   vlen floor 256, lmul 2, f64 -> l_nom = 256*2/64 = 8 -> m2
-    f, g = fields("f, g: float64[2D]", layout="c")
-    cfg = CreateKernelConfig()
-    cfg.target = Target.RISCV_RVV
-    cfg.default_dtype = "float64"
-    cfg.cpu.vectorize.enable = True
-    cfg.cpu.vectorize.mode = "vla"
     cfg.cpu.vectorize.assume_inner_stride_one = True
-    cfg.cpu.rvv.vlen = 256
-    cfg.cpu.rvv.lmul = 2
-    a, b = fields("a, b: float64[2D]", layout="c")
-    code = create_kernel(
-        [Assignment(g.center(), a.center() + b.center())], cfg
-    ).get_c_code()
-    assert "__riscv_vsetvl_e64m2" in code
-    assert "__riscv_vfadd_vv_f64m2" in code
-    assert "__riscv_vle64_v_f64m2" in code
+    return cfg
 
 
-def test_stripmine_lanes_lowering():
-    """PsVecStripmineLanes lowers to vsetvl (RVV) and min(r, l_nom) (GenericCpu)."""
-    from pystencils.backend.kernelcreation import KernelCreationContext
-    from pystencils.backend.platforms.rvv import RvvCpu
-    from pystencils.backend.platforms.generic_cpu import GenericCpu
-    from pystencils.backend.functions import PsVecStripmineLanes
-    from pystencils.backend.ast.expressions import PsExpression
-    from pystencils.backend.constants import PsConstant
-    from pystencils.types import PsUnsignedIntegerType
-    from pystencils.backend.emission import CAstPrinter
-
-    ctx = KernelCreationContext()
-    size_t = PsUnsignedIntegerType(64)
-    r = ctx.get_new_symbol("r", size_t)
-    call = PsVecStripmineLanes(64, 1, 4)(PsExpression.make(r))
-
-    rvv = RvvCpu(ctx, vlen=256, check_vlen=False)
-    rvv_code = CAstPrinter()(rvv.select_function(call.clone()))
-    assert "__riscv_vsetvl_e64m1" in rvv_code
-
-    generic = GenericCpu(ctx)
-    generic_code = CAstPrinter()(generic.select_function(call.clone()))
-    #   min(r, 4): ternary or a comparison against the nominal lane count
-    assert "4" in generic_code and ("?" in generic_code or "r" in generic_code)
+def rvv_code(asms, cfg=None) -> str:
+    return ps.create_kernel(asms, cfg or rvv_config()).get_c_code()
 
 
-def test_vla_reduction_raises():
-    x = ps.fields("x: float64[1D]")
-    w = ps.TypedSymbol("w", "float64")
-    red = reduction_assignment(w, ReductionOp.Add, x.center())
-    cfg = CreateKernelConfig()
-    cfg.target = Target.RISCV_RVV
-    cfg.default_dtype = "float64"
-    cfg.cpu.vectorize.enable = True
-    cfg.cpu.vectorize.mode = "vla"
-    cfg.cpu.rvv.vlen = 256
+#   -------------------------------------------------------------------------------------
+#   Type mapping: the analogue of `__m256d` / `__m128` on AVX
+#   -------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "stype, lanes, expected",
+    [
+        (Fp(64), 4, "vfloat64m1_t"),  # 256 bit -> one register
+        (Fp(32), 8, "vfloat32m1_t"),
+        (Fp(32), 4, "vfloat32mf2_t"),  # 128 bit -> half a register
+        (SInt(64), 4, "vint64m1_t"),
+        (SInt(32), 8, "vint32m1_t"),
+        (SInt(32), 4, "vint32mf2_t"),
+        (SInt(16), 16, "vint16m1_t"),
+    ],
+)
+def test_vector_types(stype, lanes, expected):
+    assert _rvv_type(PsVectorType(stype, lanes)).c_string() == expected
+
+
+@pytest.mark.parametrize(
+    "stype, lanes",
+    [
+        (Fp(64), 2),  # 128 bit of f64 would be `vfloat64mf2_t`, which does not exist
+        (Fp(64), 8),  # 512 bit: wider than a register (no LMUL > 1, as on AVX)
+        (Fp(32), 16),
+        (UInt(32), 8),  # unsigned: not supported (as on x86)
+        (Fp(16), 16),
+    ],
+)
+def test_unsupported_vector_types(stype, lanes):
     with pytest.raises(MaterializationError):
-        create_kernel([red], cfg).get_c_code()
+        _rvv_type(PsVectorType(stype, lanes))
 
 
-#   ---- RNG / tuple types (design decision D13) ---------------------------------
+def test_default_lanes_and_header():
+    f, g = fields("f, g: float64[2D]")
+    ker = ps.create_kernel([Assignment(g.center(), f.center())], rvv_config())
+    assert '"pystencils_runtime/rvv.hpp"' in ker.required_headers
+    code = ker.get_c_code()
+    #   4 x f64 per iteration; every intrinsic gets the literal vector length
+    assert "__riscv_vle64_v_f64m1(" in code and "4uLL)" in code
+    assert "__riscv_vse64_v_f64m1(" in code
+    assert "+= 4LL" in code
 
 
-def test_philox_f32_rng_codegen():
-    dtype = "float32"
+#   -------------------------------------------------------------------------------------
+#   Arithmetic, constants, math functions
+#   -------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype, sfx", [("float64", "f64m1"), ("float32", "f32m1")])
+def test_float_arithmetic(dtype, sfx):
+    a, b, c = fields(f"a, b, c: {dtype}[2D]")
+    code = rvv_code(
+        [Assignment(c.center(), (a.center() + 2 * b.center()) / (a.center() - b[1, 0]))],
+        rvv_config(dtype),
+    )
+    for op in ("vfadd_vv", "vfmul_vv", "vfdiv_vv", "vfmv_v_f"):
+        assert f"__riscv_{op}_{sfx}(" in code
+
+
+@pytest.mark.parametrize("dtype, sfx", [("int64", "i64m1"), ("int32", "i32m1")])
+def test_int_arithmetic(dtype, sfx):
+    a, b, c = fields(f"a, b, c: {dtype}[2D]")
+    code = rvv_code(
+        [Assignment(c.center(), a.center() * b.center() + 3)],
+        rvv_config(dtype, index_dtype=dtype),
+    )
+    assert f"__riscv_vmul_vv_{sfx}(" in code
+    assert f"__riscv_vadd_vv_{sfx}(" in code
+    assert f"__riscv_vmv_v_x_{sfx}(" in code
+
+
+def test_counter_offsets_use_set_helper():
+    #   The vectorized inner loop counter is `ctr + [0, 1, 2, 3]`; that non-uniform
+    #   constant goes through the `set_*` helper (the AVX analogue is `_mm256_set_*`).
+    f = fields("f: float64[1D]")
+    x = ps.DEFAULTS.spatial_counters[0]
+    code = rvv_code([Assignment(f.center(), tcast(x, "float64"))])
+    assert "pystencils::runtime::rvv::set_i64m1(0LL, 1LL, 2LL, 3LL)" in code
+    assert "__riscv_vfcvt_f_x_v_f64m1(" in code
+
+
+@pytest.mark.parametrize("func, intrin", [(sp.sqrt, "vfsqrt_v"), (sp.Abs, "vfabs_v")])
+def test_unary_float_math(func, intrin):
+    f, g = fields("f, g: float64[1D]")
+    code = rvv_code([Assignment(g.center(), func(f.center()))])
+    assert f"__riscv_{intrin}_f64m1(" in code
+
+
+@pytest.mark.parametrize("func, name", [(sp.Min, "min"), (sp.Max, "max")])
+@pytest.mark.parametrize("dtype, sfx, prefix", [("float64", "f64m1", "vf"), ("int32", "i32m1", "v")])
+def test_min_max(func, name, dtype, sfx, prefix):
+    a, b, c = fields(f"a, b, c: {dtype}[1D]")
+    code = rvv_code(
+        [Assignment(c.center(), func(a.center(), b.center()))],
+        rvv_config(dtype, index_dtype="int32" if dtype == "int32" else "int64"),
+    )
+    assert f"__riscv_{prefix}{name}_vv_{sfx}(" in code
+
+
+def test_integer_abs():
+    #   No integer abs instruction on RVV: |x| = max(x, -x)
+    f, g = fields("f, g: int64[1D]")
+    code = rvv_code([Assignment(g.center(), sp.Abs(f.center()))], rvv_config("int64"))
+    assert "__riscv_vneg_v_i64m1(" in code
+    assert "__riscv_vmax_vv_i64m1(" in code
+
+
+@pytest.mark.parametrize("func", [sp.floor, sp.exp])
+def test_unsupported_math(func):
+    f, g = fields("f, g: float64[1D]")
+    with pytest.raises(MaterializationError):
+        rvv_code([Assignment(g.center(), func(f.center()))])
+
+
+#   -------------------------------------------------------------------------------------
+#   Casts: at most a factor of two in element width, one intrinsic each
+#   -------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "src, dst, intrin",
+    [
+        ("float32", "float64", "vfwcvt_f_f_v_f64m1"),
+        ("float64", "float32", "vfncvt_f_f_w_f32mf2"),
+        ("int32", "float64", "vfwcvt_f_x_v_f64m1"),
+        ("float64", "int32", "vfncvt_rtz_x_f_w_i32mf2"),
+        ("int64", "float64", "vfcvt_f_x_v_f64m1"),
+        ("float64", "int64", "vfcvt_rtz_x_f_v_i64m1"),
+        ("int32", "int64", "vsext_vf2_i64m1"),
+        ("int64", "int32", "vncvt_x_x_w_i32mf2"),
+        ("int32", "float32", "vfcvt_f_x_v_f32m1"),
+        ("float32", "int32", "vfcvt_rtz_x_f_v_i32m1"),
+        ("int64", "float32", "vfncvt_f_x_w_f32mf2"),
+        ("float32", "int64", "vfwcvt_rtz_x_f_v_i64m1"),
+    ],
+)
+def test_casts(src, dst, intrin):
+    inp = fields(f"inp: {src}[1D]")
+    outp = fields(f"outp: {dst}[1D]")
+    #   Same setup as tests/kernelcreation/test_type_cast.py: the wider type sets the lanes
+    max_width = max(np.dtype(src).itemsize, np.dtype(dst).itemsize) * 8
+    code = rvv_code(
+        [Assignment(outp.center(), tcast(inp.center(), dst))],
+        rvv_config(f"float{max_width}"),
+    )
+    assert f"__riscv_{intrin}(" in code
+
+
+#   -------------------------------------------------------------------------------------
+#   Memory access
+#   -------------------------------------------------------------------------------------
+
+
+def test_strided_load_store():
+    f = fields("f: float64[2D]", layout="c")
+    cfg = rvv_config()
+    cfg.cpu.vectorize.assume_inner_stride_one = False
+    code = rvv_code([Assignment(f.center(), 2 * f.center())], cfg)
+    #   Strides are passed in bytes
+    assert "__riscv_vlse64_v_f64m1(" in code
+    assert "__riscv_vsse64_v_f64m1(" in code
+    assert "8LL * _stride_f_1" in code
+
+
+#   -------------------------------------------------------------------------------------
+#   Reductions
+#   -------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "op, helper",
+    [
+        (ReductionOp.Add, "add"),
+        (ReductionOp.Sub, "add"),  # accumulates the negated terms, like x86
+        (ReductionOp.Mul, "mul"),
+        (ReductionOp.Min, "min"),
+        (ReductionOp.Max, "max"),
+    ],
+)
+@pytest.mark.parametrize("dtype, sfx", [("float64", "f64m1"), ("float32", "f32m1")])
+def test_reductions(op, helper, dtype, sfx):
+    w = TypedSymbol("w", dtype)
+    x = fields(f"x: {dtype}[1D]")
+    code = rvv_code([reduction_assignment(w, op, x.center())], rvv_config(dtype))
+    assert f"pystencils::runtime::rvv::horizontal_{helper}_{sfx}(" in code
+
+
+#   -------------------------------------------------------------------------------------
+#   Random number generation
+#   -------------------------------------------------------------------------------------
+
+
+def philox_asms(dtype: str):
     rng = ps.random.Philox("philox", dtype, seed=0x7EADBEEF, offsets=(0, 0))
     q = rng.vector_size
     f = fields(f"f({q}): {dtype}[2D]", layout="fzyx")
-    c = ps.TypedSymbol("c", ps.DynamicType.INDEX_TYPE)
+    c = TypedSymbol("c", DynamicType.INDEX_TYPE)
     rx, rasm = rng.get_random_vector(c)
-    asms = [rasm] + [Assignment(f.center(i), rx[i]) for i in range(q)]
-
-    #   lanes=4 @ vlen=128 -> u32 counters at LMUL=1 (== VLMAX(e32m1))
-    code = rvv_c_code(
-        asms, vlen=128, lanes=4, default_dtype=dtype, index_dtype="int32"
-    )
-    assert "pystencils::runtime::rvv::random::philox_float32" in code
-    assert "__riscv_vget_v_f32m1x4_f32m1" in code
-    assert "vfloat32m1x4_t" in code
-
-
-def test_philox_f64_rng_deferred():
-    dtype = "float64"
-    rng = ps.random.Philox("philox", dtype, seed=0x7EADBEEF, offsets=(0, 0))
-    q = rng.vector_size
-    f = fields(f"f({q}): {dtype}[2D]", layout="fzyx")
-    c = ps.TypedSymbol("c", ps.DynamicType.INDEX_TYPE)
-    rx, rasm = rng.get_random_vector(c)
-    asms = [rasm] + [Assignment(f.center(i), rx[i]) for i in range(q)]
-    with pytest.raises(MaterializationError):
-        rvv_c_code(asms, vlen=256, lanes=4, default_dtype=dtype, index_dtype="int64")
-
-
-def test_rng_wrong_lmul_raises():
-    dtype = "float32"
-    rng = ps.random.Philox("philox", dtype, seed=1, offsets=(0, 0))
-    q = rng.vector_size
-    f = fields(f"f({q}): {dtype}[2D]", layout="fzyx")
-    c = ps.TypedSymbol("c", ps.DynamicType.INDEX_TYPE)
-    rx, rasm = rng.get_random_vector(c)
-    asms = [rasm] + [Assignment(f.center(i), rx[i]) for i in range(q)]
-    #   lanes=4 @ vlen=256 -> u32 counters at LMUL=1/2, not 1 -> must raise
-    with pytest.raises(MaterializationError):
-        rvv_c_code(asms, vlen=256, lanes=4, default_dtype=dtype, index_dtype="int32")
-
-
-#   ---- Casts (design decision D11) ---------------------------------------------
+    return [rasm] + [Assignment(f(i), rx[i]) for i in range(q)]
 
 
 @pytest.mark.parametrize(
-    "src, dst, lanes, expected",
+    "dtype, func, tuple_type, vget",
     [
-        #   same-width float<->int: must use the round-toward-zero (_rtz_) variant
-        ("float64", "int64", 4, "__riscv_vfcvt_rtz_x_f_v_i64m1"),
-        ("float32", "int32", 8, "__riscv_vfcvt_rtz_x_f_v_i32m1"),
-        ("int64", "float64", 4, "__riscv_vfcvt_f_x_v_f64m1"),
-        ("int32", "float32", 8, "__riscv_vfcvt_f_x_v_f32m1"),
-        #   float widening / narrowing
-        ("float32", "float64", 4, "__riscv_vfwcvt_f_f_v_f64m1"),
-        ("float64", "float32", 8, "__riscv_vfncvt_f_f_w_f32m1"),
-        #   integer widening (single op) / narrowing
-        ("int32", "int64", 4, "__riscv_vsext_vf2_i64m1"),
-        ("int64", "int32", 8, "__riscv_vncvt_x_x_w_i32m1"),
+        ("float32", "philox_float32", "vfloat32m1x4_t", "__riscv_vget_v_f32m1x4_f32m1"),
+        ("float64", "philox_float64", "vfloat64m1x2_t", "__riscv_vget_v_f64m1x2_f64m1"),
     ],
 )
-def test_cast_intrinsics(src, dst, lanes, expected):
-    fsrc = fields(f"fsrc: {src}[2D]", layout="fzyx")
-    fdst = fields(f"fdst: {dst}[2D]", layout="fzyx")
-    #   default_dtype chosen so that the derived lanes give the intended LMUL
-    default = src if "float" in src else dst
-    code = rvv_c_code(
-        [Assignment(fdst.center(), tcast(fsrc.center(), dst))],
-        vlen=256,
-        lanes=lanes,
-        default_dtype=default,
-        index_dtype="int64",
+def test_philox(dtype, func, tuple_type, vget):
+    width = np.dtype(dtype).itemsize * 8
+    #   Counters must have the width of the results (as in tests/kernelcreation/test_rng.py)
+    code = rvv_code(philox_asms(dtype), rvv_config(dtype, index_dtype=f"int{width}"))
+    assert f"pystencils::runtime::rvv::random::{func}(" in code
+    assert tuple_type in code
+    assert f"{vget}(" in code
+
+
+#   -------------------------------------------------------------------------------------
+#   Compile the generated code with a RISC-V compiler (if available)
+#   -------------------------------------------------------------------------------------
+
+
+def _riscv_cxx() -> str | None:
+    if platform.machine() == "riscv64":
+        return shutil.which("g++")
+    return shutil.which("riscv64-linux-gnu-g++")
+
+
+def _compile_kernels():
+    """A handful of kernels covering every code path of the RVV selector."""
+    a, b, c = fields("a, b, c: float64[2D]")
+    s32 = fields("s32: float32[1D]")
+    i32 = fields("i32: int32[1D]")
+    d64 = fields("d64: float64[1D]")
+    w = TypedSymbol("w", "float64")
+    strided = fields("strided: float64[2D]", layout="c")
+    strided_cfg = rvv_config()
+    strided_cfg.cpu.vectorize.assume_inner_stride_one = False
+    x = ps.DEFAULTS.spatial_counters[0]
+
+    return {
+        "arith": ([Assignment(c.center(), sp.sqrt(sp.Abs(a.center())) * 2 + b[1, 0] / a[0, 1])], rvv_config()),
+        "minmax": ([Assignment(c.center(), sp.Max(a.center(), sp.Min(b.center(), 1.5)))], rvv_config()),
+        "casts": (
+            [Assignment(d64.center(), tcast(s32.center(), "float64") + tcast(i32.center(), "float64")),
+             Assignment(i32.center(), tcast(d64.center(), "int32"))],
+            rvv_config(),
+        ),
+        "counter": ([Assignment(d64.center(), tcast(x, "float64") * 0.5)], rvv_config()),
+        "reduction": ([reduction_assignment(w, ReductionOp.Max, d64.center())], rvv_config()),
+        "strided": ([Assignment(strided.center(), 3 * strided.center())], strided_cfg),
+        "philox32": (philox_asms("float32"), rvv_config("float32", index_dtype="int32")),
+        "philox64": (philox_asms("float64"), rvv_config("float64", index_dtype="int64")),
+    }
+
+
+@pytest.mark.parametrize("name", list(_compile_kernels().keys()))
+def test_generated_code_compiles(name):
+    cxx = _riscv_cxx()
+    if cxx is None:
+        pytest.skip("no RISC-V C++ compiler available")
+
+    from pystencils.include import get_pystencils_include_path
+
+    asms, cfg = _compile_kernels()[name]
+    ker = ps.create_kernel(asms, cfg)
+    source = "\n".join(
+        [f"#include {h}" for h in sorted(ker.required_headers)]
+        + ["#define RESTRICT __restrict__", ker.get_c_code()]
     )
-    assert expected in code, f"missing {expected}"
 
-
-#   ---- Integer completeness ops ------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "builder, expected",
-    [
-        (lambda a, b: a + b, "__riscv_vadd_vv_i64m1"),
-        (lambda a, b: a * b, "__riscv_vmul_vv_i64m1"),
-    ],
-)
-def test_integer_ops(builder, expected):
-    #   Bitwise/shift/rem intrinsics are implemented in the platform but are awkward to
-    #   express through sympy field accesses (`&` becomes a boolean And); they are
-    #   exercised directly at the IR level below.
-    a, b, g = fields("a, b, g: int64[2D]", layout="fzyx")
-    code = rvv_c_code(
-        [Assignment(g.center(), builder(a.center(), b.center()))],
-        vlen=256,
-        lanes=4,
-        default_dtype="int64",
-        index_dtype="int64",
-    )
-    assert expected in code
-
-
-@pytest.mark.parametrize(
-    "op_cls, expected",
-    [
-        ("PsIntDiv", "__riscv_vdiv_vv_i64m1"),
-        ("PsRem", "__riscv_vrem_vv_i64m1"),
-        ("PsBitwiseAnd", "__riscv_vand_vv_i64m1"),
-        ("PsBitwiseOr", "__riscv_vor_vv_i64m1"),
-        ("PsBitwiseXor", "__riscv_vxor_vv_i64m1"),
-        ("PsLeftShift", "__riscv_vsll_vv_i64m1"),
-        ("PsRightShift", "__riscv_vsra_vv_i64m1"),
-    ],
-)
-def test_integer_bitwise_shift_ir_level(op_cls, expected):
-    """Exercise div/rem/bitwise/shift intrinsic selection directly at the IR level."""
-    from pystencils.backend.kernelcreation import KernelCreationContext
-    from pystencils.backend.platforms.rvv import SelectIntrinsicsRvv, RvvSelectionContext
-    from pystencils.backend.ast.expressions import PsExpression, PsSymbolExpr
-    from pystencils.backend import ast as _ast_mod
-    import pystencils.backend.ast.expressions as exprs
-    from pystencils.types import PsVectorType, PsSignedIntegerType
-    from pystencils.backend.emission import CAstPrinter
-
-    ctx = KernelCreationContext()
-    sel = SelectIntrinsicsRvv(ctx, vlen=256, check_vlen=False)
-    sc = RvvSelectionContext(sel)
-
-    vtype = PsVectorType(PsSignedIntegerType(64), 4)
-    a = ctx.get_new_symbol("a", sel._vtype_intrin(vtype))
-    b = ctx.get_new_symbol("b", sel._vtype_intrin(vtype))
-    lhs = PsSymbolExpr(a)
-    rhs = PsSymbolExpr(b)
-
-    OpCls = getattr(exprs, op_cls)
-    node = OpCls(lhs, rhs)
-    node.dtype = vtype
-
-    result = sel.op_intrinsic(node, [lhs, rhs], sc)
-    code = CAstPrinter()(result)
-    assert expected in code, f"got: {code}"
+    cmd = [
+        cxx, "-std=c++17", "-fsyntax-only", "-march=rv64gcv_zvl256b",
+        f"-I{get_pystencils_include_path()}", "-x", "c++", "-",
+    ]
+    result = subprocess.run(cmd, input=source, capture_output=True, text=True)
+    assert result.returncode == 0, f"{result.stderr}\n--- source ---\n{source}"

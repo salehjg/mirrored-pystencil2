@@ -169,7 +169,12 @@ def function_domain(function_name, dtype):
             [
                 t
                 for t in AVAIL_TARGETS
-                if not (Target._AVX512 in t or Target._NEON in t or t == Target.ARM_SVE)
+                if not (
+                    Target._AVX512 in t
+                    or Target._NEON in t
+                    or t == Target.ARM_SVE
+                    or t == Target.RISCV_RVV
+                )
             ],
         )
     )
