@@ -40,6 +40,7 @@ from ..ast.expressions import (
     PsSubscript,
 )
 from ..ast.vector import PsVecMemAcc, PsVecBroadcast, PsVecHorizontal
+from ..ast.structural import PsBlock
 from ...sympyextensions import ReductionOp
 from ...types import (
     PsCustomType,
@@ -56,7 +57,7 @@ from ..constants import PsConstant
 from ..exceptions import MaterializationError
 from ..functions import CFunction, PsMathFunction, MathFunctions
 from ..kernelcreation import KernelCreationContext, Typifier
-from ..transformations import SelectIntrinsics, EliminateConstants
+from ..transformations import SelectIntrinsics, EliminateConstants, InsertPrefetches
 from ..transformations.select_intrinsics import SelectionContext
 from .generic_cpu import GenericVectorCpu
 
@@ -148,6 +149,23 @@ class RvvCpu(GenericVectorCpu):
                 "`__builtin_convertvector` is not supported on the RVV platform."
             )
         return SelectIntrinsicsRvv(self._ctx)
+
+    def insert_prefetches(self, kernel_ast: PsBlock, distance_bytes: int) -> PsBlock:
+        """Zicbop software prefetches (`prefetch.r` / `prefetch.w`) in the innermost vector loops.
+
+        The calls go to ``pystencils::runtime::rvv::prefetch_{read,write}`` (rvv.hpp). Their
+        encodings are RISC-V HINTs, so the kernels stay correct, and the prefetches become
+        no-ops, on cores without Zicbop.
+        """
+
+        def make_prefetch(addr: PsExpression, elem_type: PsType, write: bool) -> PsExpression:
+            name = "pystencils::runtime::rvv::prefetch_" + ("write" if write else "read")
+            func = CFunction(name, (PsPointerType(elem_type),), PsVoidType())
+            call = func(addr)
+            call.dtype = PsVoidType()
+            return call
+
+        return cast(PsBlock, InsertPrefetches(self._ctx, distance_bytes, make_prefetch)(kernel_ast))
 
 
 class SelectIntrinsicsRvv(SelectIntrinsics):

@@ -205,6 +205,56 @@ def test_strided_load_store():
 
 
 #   -------------------------------------------------------------------------------------
+#   Software prefetch (`cpu.vectorize.prefetch_distance`)
+#   -------------------------------------------------------------------------------------
+
+
+def _prefetches(code: str) -> list[tuple[str, str]]:
+    import re
+
+    return re.findall(r"pystencils::runtime::rvv::prefetch_(read|write)\(([^;]*)\);", code)
+
+
+def test_prefetch_off_by_default():
+    f, g = fields("f, g: float64[2D]")
+    assert not _prefetches(rvv_code([Assignment(g.center(), f[1, 0] + f[-1, 0])]))
+
+
+def test_prefetch_one_per_distinct_access():
+    f, g = fields("f, g: float32[2D]")
+    cfg = rvv_config("float32")
+    cfg.cpu.vectorize.prefetch_distance = 128
+    #   f[1, 0] is read twice: one prefetch; g is written: a write prefetch
+    code = rvv_code([Assignment(g.center(), f[1, 0] * f[1, 0] + f[0, 1])], cfg)
+    pf = _prefetches(code)
+    assert sorted(kind for kind, _ in pf) == ["read", "read", "write"]
+    #   128 bytes ahead = 32 floats, and only inside the vector loop (not the remainder loop)
+    assert all(addr.endswith(" + 32LL]") for _, addr in pf)
+    vec_loop = code[code.index("ctr_1__1 += 8LL") :]
+    assert vec_loop.index("prefetch_read") < vec_loop.index("__riscv_vle32_v_f32m1")
+    assert code.count("prefetch_") == 3
+
+
+def test_prefetch_read_and_written_address_gets_write_prefetch():
+    f = fields("f: float64[2D]")
+    cfg = rvv_config()
+    cfg.cpu.vectorize.prefetch_distance = 64
+    pf = _prefetches(rvv_code([Assignment(f.center(), 2 * f.center())], cfg))
+    assert [kind for kind, _ in pf] == ["write"]
+    assert pf[0][1].endswith(" + 8LL]")
+
+
+def test_prefetch_needs_vector_platform():
+    f, g = fields("f, g: float64[2D]")
+    cfg = ps.CreateKernelConfig(target=Target.X86_AVX)
+    cfg.cpu.vectorize.enable = True
+    cfg.cpu.vectorize.assume_inner_stride_one = True
+    cfg.cpu.vectorize.prefetch_distance = 64
+    with pytest.raises(MaterializationError):
+        ps.create_kernel([Assignment(g.center(), f.center())], cfg)
+
+
+#   -------------------------------------------------------------------------------------
 #   Reductions
 #   -------------------------------------------------------------------------------------
 
@@ -279,6 +329,8 @@ def _compile_kernels():
     strided_cfg = rvv_config()
     strided_cfg.cpu.vectorize.assume_inner_stride_one = False
     x = ps.DEFAULTS.spatial_counters[0]
+    prefetch_cfg = rvv_config("float32")
+    prefetch_cfg.cpu.vectorize.prefetch_distance = 128
 
     return {
         "arith": ([Assignment(c.center(), sp.sqrt(sp.Abs(a.center())) * 2 + b[1, 0] / a[0, 1])], rvv_config()),
@@ -291,6 +343,7 @@ def _compile_kernels():
         "counter": ([Assignment(d64.center(), tcast(x, "float64") * 0.5)], rvv_config()),
         "reduction": ([reduction_assignment(w, ReductionOp.Max, d64.center())], rvv_config()),
         "strided": ([Assignment(strided.center(), 3 * strided.center())], strided_cfg),
+        "prefetch": ([Assignment(s32.center(), 2 * s32[1])], prefetch_cfg),
         "philox32": (philox_asms("float32"), rvv_config("float32", index_dtype="int32")),
         "philox64": (philox_asms("float64"), rvv_config("float64", index_dtype="int64")),
     }

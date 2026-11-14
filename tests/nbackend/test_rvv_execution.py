@@ -73,3 +73,22 @@ def test_float_to_int_truncates(src, dst):
     out = np.zeros_like(values, dtype=dst)
     kernel(inp=values, outp=out)
     np.testing.assert_array_equal(out, values.astype(dst))
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+def test_prefetch_does_not_change_results(dtype):
+    """Software prefetches are hints: the kernel output must be bit-identical."""
+    f, g = fields(f"f, g: {dtype}[2D]")
+    asms = [Assignment(g.center(), f[1, 0] + 2 * f[-1, 0] - f[0, 1] * f[0, -1])]
+    rng = np.random.default_rng(3)
+    src = rng.random((37, 29)).astype(dtype)
+    results = []
+    for distance in (None, 128):
+        cfg = make_config(Target.RISCV_RVV, dtype)
+        cfg.cpu.vectorize.prefetch_distance = distance
+        kernel = ps.create_kernel(asms, cfg)
+        assert ("prefetch_read" in kernel.get_c_code()) == (distance is not None)
+        dst = np.zeros_like(src)
+        kernel.compile()(f=src, g=dst)
+        results.append(dst)
+    np.testing.assert_array_equal(results[0], results[1])

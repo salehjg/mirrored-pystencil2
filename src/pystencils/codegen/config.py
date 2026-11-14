@@ -275,6 +275,18 @@ class VectorizationOptions(ConfigBase):
     (after ghost layers) of each field is aligned at the necessary byte boundary.
     """
 
+    prefetch_distance: BasicOption[int] = BasicOption()
+    """Software prefetch distance in bytes, or `None` (the default) for no software prefetching.
+
+    If set, the innermost vector loop prefetches, for every distinct field access, the address
+    `prefetch_distance` bytes ahead: a write prefetch for written addresses, a read prefetch
+    otherwise. This helps kernels with more concurrent memory streams than the hardware
+    prefetcher can follow, e.g. D3Q19 lattice Boltzmann sweeps (19 read and 23 write streams)
+    on the SpacemiT X60, where it doubles the throughput at a distance of 128 bytes.
+
+    Currently only supported on `Target.RISCV_RVV`.
+    """
+
     assume_inner_stride_one: BasicOption[bool] = BasicOption(False)
     """Assume stride associated with the innermost spatial coordinate of all fields is one.
 

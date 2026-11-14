@@ -104,6 +104,7 @@ from .reductions_to_memory import ReductionsToMemory
 from .lower_to_c import LowerToC
 from .select_functions import SelectFunctions
 from .select_intrinsics import SelectIntrinsics
+from .insert_prefetches import InsertPrefetches
 
 __all__ = [
     "CanonicalizeSymbols",
@@ -127,4 +128,5 @@ __all__ = [
     "LowerToC",
     "SelectFunctions",
     "SelectIntrinsics",
+    "InsertPrefetches",
 ]

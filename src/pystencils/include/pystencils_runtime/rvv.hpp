@@ -132,6 +132,35 @@ namespace pystencils::runtime::rvv
 #undef PYSTENCILS_RVV_DEFINE_HORIZONTAL
 
     /**
+     * SOFTWARE PREFETCH
+     *
+     * Emitted by the code generator when `cpu.vectorize.prefetch_distance` is set. These are
+     * Zicbop's `prefetch.r` / `prefetch.w`, which are encoded as RISC-V HINTs
+     * (`ori x0, rs1, imm`): cores without Zicbop execute them as no-ops, so no `-march`
+     * flag is needed. The SpacemiT X60 executes them although its ISA string does not list
+     * Zicbop. With `-march=..._zicbop` the compiler builtin is used, which can fold the offset.
+     */
+    template <typename T>
+    inline void prefetch_read(const T *p)
+    {
+#if defined(__riscv_zicbop)
+        __builtin_prefetch(p, 0, 3);
+#else
+        __asm__ volatile("ori x0, %0, 1" : : "r"(p));
+#endif
+    }
+
+    template <typename T>
+    inline void prefetch_write(const T *p)
+    {
+#if defined(__riscv_zicbop)
+        __builtin_prefetch(p, 1, 3);
+#else
+        __asm__ volatile("ori x0, %0, 3" : : "r"(p));
+#endif
+    }
+
+    /**
      * RANDOM NUMBER GENERATION
      *
      * Same contract as `pystencils::runtime::x86::random`: counters come in as vectors of

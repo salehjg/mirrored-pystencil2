@@ -23,6 +23,7 @@ from ..constants import PsConstant
 from ..ast.structural import (
     PsStructuralNode,
     PsAssignment,
+    PsBlock,
 )
 from ..ast.expressions import PsExpression
 from ..kernelcreation import Typifier
@@ -173,3 +174,13 @@ class GenericVectorCpu(GenericCpu, ABC):
     ) -> SelectIntrinsics:
         """Return an instance of a subclass of `SelectIntrinsics`
         to perform vector intrinsic selection for this platform."""
+
+    def insert_prefetches(self, kernel_ast: PsBlock, distance_bytes: int) -> PsBlock:
+        """Insert software prefetches into the innermost vector loops (see `InsertPrefetches`).
+
+        Platforms that support it override this; the default refuses.
+        """
+        raise MaterializationError(
+            f"Software prefetching (`cpu.vectorize.prefetch_distance`) is not supported "
+            f"on platform {type(self).__name__}."
+        )
