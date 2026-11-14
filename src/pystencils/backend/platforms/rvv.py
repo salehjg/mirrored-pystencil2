@@ -24,6 +24,7 @@ is told VLEN >= 256 (``-march=rv64gcv_zvl256b``), which is the flag the JIT pass
 from __future__ import annotations
 from typing import Sequence, cast
 
+from ..ast import PsAstNode
 from ..ast.expressions import (
     PsExpression,
     PsAddressOf,
@@ -34,13 +35,16 @@ from ..ast.expressions import (
     PsSub,
     PsMul,
     PsDiv,
+    PsNeg,
     PsConstantExpr,
+    PsSymbolExpr,
     PsCast,
     PsCall,
     PsSubscript,
 )
 from ..ast.vector import PsVecMemAcc, PsVecBroadcast, PsVecHorizontal
-from ..ast.structural import PsBlock
+from ..ast.structural import PsBlock, PsDeclaration, PsAssignment, PsStructuralNode
+from ..memory import PsSymbol
 from ...sympyextensions import ReductionOp
 from ...types import (
     PsCustomType,
@@ -50,6 +54,7 @@ from ...types import (
     PsType,
     PsVoidType,
     PsShortArrayType,
+    constify,
     deconstify,
 )
 from ...types.quick import Fp, SInt, UInt
@@ -57,8 +62,9 @@ from ..constants import PsConstant
 from ..exceptions import MaterializationError
 from ..functions import CFunction, PsMathFunction, MathFunctions
 from ..kernelcreation import KernelCreationContext, Typifier
-from ..transformations import SelectIntrinsics, EliminateConstants, InsertPrefetches
+from ..transformations import SelectIntrinsics, EliminateConstants, InsertPrefetches, HoistRowPointers
 from ..transformations.select_intrinsics import SelectionContext
+from ..ast.analysis import collect_undefined_symbols
 from .generic_cpu import GenericVectorCpu
 
 
@@ -150,6 +156,15 @@ class RvvCpu(GenericVectorCpu):
             )
         return SelectIntrinsicsRvv(self._ctx)
 
+    def prepare_vector_loops(self, kernel_ast: PsBlock) -> PsBlock:
+        """One row base pointer per contiguous access of the innermost loops (`HoistRowPointers`).
+
+        RISC-V has no register + register addressing and RVV loads/stores take no immediate
+        offset, so without this GCC adds stencil offsets such as ``x - 1`` to a shared pointer
+        in every iteration and spills the extra addresses.
+        """
+        return cast(PsBlock, HoistRowPointers(self._ctx)(kernel_ast))
+
     def insert_prefetches(self, kernel_ast: PsBlock, distance_bytes: int) -> PsBlock:
         """Zicbop software prefetches (`prefetch.r` / `prefetch.w`) in the innermost vector loops.
 
@@ -169,6 +184,28 @@ class RvvCpu(GenericVectorCpu):
 
 
 class SelectIntrinsicsRvv(SelectIntrinsics):
+    """RVV intrinsic selection.
+
+    Beyond the one-to-one mapping of IR operations to intrinsics, two rewrites keep the
+    vector loop short:
+
+    - Scalar operands: an operand that is the same in every lane (a uniform constant, a
+      broadcast, or a vector symbol declared as one of those, such as the hoisted constants
+      of a kernel) is passed as a scalar to the ``.vf`` form of the operation
+      (``vfadd_vf``, ``vfrsub_vf``, ...), instead of occupying a vector register. Every such
+      vector declaration gets a scalar twin declared right before it, unless the symbol is
+      assigned again later (e.g. a reduction accumulator).
+    - Fused multiply-add: ``a * b + c``, ``a * b - c`` and ``c - a * b`` become ``vfmacc``,
+      ``vfmsac`` and ``vfnmsac``. RVV intrinsics are opaque to the compiler, so it cannot
+      contract them itself as it does for scalar code and x86 vector code by default.
+
+    Scalar twins whose value is a compile-time constant are passed through
+    ``pystencils::runtime::rvv::in_register`` (rvv.hpp). Otherwise GCC reloads each of them
+    from the constant pool in every loop iteration (an address computation plus a load per
+    use) instead of keeping it in one of the floating-point registers, which a vector loop
+    leaves idle.
+    """
+
     def __init__(self, ctx: KernelCreationContext):
         super().__init__(ctx)
 
@@ -179,10 +216,108 @@ class SelectIntrinsicsRvv(SelectIntrinsics):
             return elim_constants(typify(expr))
 
         self._type_fold = type_fold
+        #   Uniform floating-point vector symbols -> their scalar twins
+        self._uniform: dict[PsSymbol, PsSymbol] = dict()
+        #   id(IR expression) -> (expression, is uniform); holding the expression keeps the id unique
+        self._is_uniform_memo: dict[int, tuple[PsExpression, bool]] = dict()
+        #   Symbols assigned anywhere besides their declaration: never uniform
+        self._reassigned: set[PsSymbol] = set()
+
+    def __call__(self, node: PsBlock) -> PsBlock:
+        def collect(n: PsAstNode) -> None:
+            if isinstance(n, PsAssignment) and not isinstance(n, PsDeclaration) and isinstance(n.lhs, PsSymbolExpr):
+                self._reassigned.add(n.lhs.symbol)
+            for c in n.children:
+                collect(c)
+
+        collect(node)
+        return super().__call__(node)
+
+    def visit(self, node: PsAstNode, sc: SelectionContext) -> PsAstNode:
+        if not isinstance(node, PsBlock):
+            return super().visit(node, sc)
+
+        statements: list[PsStructuralNode] = []
+        for stmt in node.statements:
+            if isinstance(stmt, PsDeclaration) and isinstance(stmt.lhs, PsSymbolExpr):
+                vtype = deconstify(stmt.lhs.get_dtype())
+                if (
+                    isinstance(vtype, PsVectorType)
+                    and vtype.scalar_type.is_float()
+                    and stmt.lhs.symbol not in self._reassigned
+                ):
+                    scalar = self._uniform_scalar(stmt.rhs)
+                    if scalar is not None:
+                        vsymb = stmt.lhs.symbol
+                        stype = vtype.scalar_type
+                        ssymb = self._ctx.get_new_symbol(f"{vsymb.name}_s", constify(stype))
+                        self._uniform[vsymb] = ssymb
+                        if not collect_undefined_symbols(scalar):
+                            scalar = self._in_register(scalar, stype)
+                        statements.append(PsDeclaration(PsSymbolExpr(ssymb), scalar))
+            statements.append(cast(PsStructuralNode, self.visit(stmt, sc)))
+        node.statements = statements
+        return node
+
+    def _is_uniform(self, expr: PsExpression) -> bool:
+        """Whether all lanes of the IR vector expression `expr` are provably equal (memoized: the
+        selector asks again for every enclosing operation)."""
+        memo = self._is_uniform_memo.get(id(expr))
+        if memo is not None:
+            return memo[1]
+        match expr:
+            case PsConstantExpr(c) if isinstance(c.dtype, PsVectorType):
+                values = list(c.value)
+                uniform = all(v.tobytes() == values[0].tobytes() for v in values)
+            case PsVecBroadcast():
+                uniform = True
+            case PsSymbolExpr(symb):
+                uniform = symb in self._uniform
+            case PsAdd() | PsSub() | PsMul() | PsDiv():
+                uniform = self._is_uniform(expr.operand1) and self._is_uniform(expr.operand2)
+            case PsNeg():
+                uniform = self._is_uniform(expr.operand)
+            case _:
+                uniform = False
+        self._is_uniform_memo[id(expr)] = (expr, uniform)
+        return uniform
+
+    def _uniform_scalar(self, expr: PsExpression) -> PsExpression | None:
+        """The scalar value of every lane of the IR vector expression `expr`, if all lanes are equal."""
+        if not self._is_uniform(expr):
+            return None
+        result: PsExpression | None = None
+        match expr:
+            case PsConstantExpr(c) if isinstance(c.dtype, PsVectorType):
+                values = list(c.value)
+                if all(v.tobytes() == values[0].tobytes() for v in values):
+                    result = PsConstantExpr(PsConstant(values[0], c.dtype.scalar_type))
+            case PsVecBroadcast():
+                result = expr.operand.clone()
+            case PsSymbolExpr(symb) if symb in self._uniform:
+                result = PsSymbolExpr(self._uniform[symb])
+            case PsAdd() | PsSub() | PsMul() | PsDiv():
+                s1 = self._uniform_scalar(expr.operand1)
+                s2 = self._uniform_scalar(expr.operand2)
+                if s1 is not None and s2 is not None:
+                    result = type(expr)(s1, s2)
+            case PsNeg():
+                s = self._uniform_scalar(expr.operand)
+                if s is not None:
+                    result = PsNeg(s)
+        return None if result is None else self._type_fold(result)
 
     #   ---------------------------------------------------------------------------------
     #   Helpers
     #   ---------------------------------------------------------------------------------
+
+    @staticmethod
+    def _in_register(scalar: PsExpression, stype: PsScalarType) -> PsExpression:
+        """``pystencils::runtime::rvv::in_register(scalar)``: the same value, opaque to the optimizer."""
+        func = CFunction("pystencils::runtime::rvv::in_register", (stype,), stype)
+        call = func(scalar)
+        call.dtype = constify(stype)
+        return call
 
     @staticmethod
     def _vl(vtype: PsVectorType) -> PsExpression:
@@ -276,6 +411,10 @@ class SelectIntrinsicsRvv(SelectIntrinsics):
                 return self._broadcast(vtype, operands[0])
             case PsCast():
                 return self._cast(expr, operands[0])
+            case PsAdd() | PsSub() | PsMul() | PsDiv() if is_float and (
+                (special := self._float_binop(expr, operands, vtype)) is not None
+            ):
+                return special
             case PsAdd():
                 stem = "vfadd_vv" if is_float else "vadd_vv"
             case PsSub():
@@ -297,6 +436,100 @@ class SelectIntrinsicsRvv(SelectIntrinsics):
             *operands,
             self._vl(vtype),
         )
+
+    #   .vf forms (scalar operand) and fused multiply-add, see the class docstring
+    _VF_STEMS = {PsAdd: "vfadd_vf", PsSub: "vfsub_vf", PsMul: "vfmul_vf", PsDiv: "vfdiv_vf"}
+    _VF_STEMS_REVERSED = {PsAdd: "vfadd_vf", PsSub: "vfrsub_vf", PsMul: "vfmul_vf", PsDiv: "vfrdiv_vf"}
+
+    def _float_binop(
+        self, expr: PsBinOp, operands: Sequence[PsExpression], vtype: PsVectorType
+    ) -> PsExpression | None:
+        s1 = self._uniform_scalar(expr.operand1)
+        s2 = self._uniform_scalar(expr.operand2)
+        if s1 is not None and s2 is not None:
+            return None  # uniform as a whole: computed once, outside the loop
+
+        if isinstance(expr, PsAdd | PsSub):
+            fused = self._fma(expr, operands, s1, s2, vtype)
+            if fused is not None:
+                return fused
+
+        if s2 is not None:
+            return self._vf(self._VF_STEMS[type(expr)], vtype, operands[0], s2)
+        if s1 is not None:
+            return self._vf(self._VF_STEMS_REVERSED[type(expr)], vtype, operands[1], s1)
+        return None
+
+    def _vf(self, stem: str, vtype: PsVectorType, vec: PsExpression, scalar: PsExpression) -> PsExpression:
+        rtype = _rvv_type(vtype)
+        return self._call(
+            f"__riscv_{stem}_{_sfx(vtype)}", (rtype, vtype.scalar_type, _SIZE_T), rtype, vec, scalar, self._vl(vtype)
+        )
+
+    @staticmethod
+    def _as_product(lowered: PsExpression) -> tuple[str, PsExpression, PsExpression] | None:
+        """If `lowered` is a ``vfmul`` intrinsic call: its form ('vv' or 'vf') and its two factors,
+        a scalar factor (form 'vf') first."""
+        if isinstance(lowered, PsCall) and isinstance(lowered.function, CFunction):
+            name = lowered.function.name
+            if name.startswith("__riscv_vfmul_vv_"):
+                return "vv", lowered.args[0], lowered.args[1]
+            if name.startswith("__riscv_vfmul_vf_"):
+                return "vf", lowered.args[1], lowered.args[0]
+        return None
+
+    def _fma(
+        self,
+        expr: PsAdd | PsSub,
+        operands: Sequence[PsExpression],
+        s1: PsExpression | None,
+        s2: PsExpression | None,
+        vtype: PsVectorType,
+    ) -> PsExpression | None:
+        """``a * b + c`` -> vfmacc(c, a, b), ``a * b - c`` -> vfmsac(c, a, b), ``c - a * b`` -> vfnmsac(c, a, b).
+
+        ``a * b - c`` also arrives as ``(-1) * c + a * b``, which is how sympy writes it."""
+        rtype = _rvv_type(vtype)
+
+        def fused(stem: str, form: str, acc: PsExpression, x: PsExpression, y: PsExpression) -> PsExpression:
+            x_type = vtype.scalar_type if form == "vf" else rtype
+            return self._call(
+                f"__riscv_{stem}_{form}_{_sfx(vtype)}", (rtype, x_type, rtype, _SIZE_T), rtype, acc, x, y, self._vl(vtype)
+            )
+
+        if isinstance(expr, PsAdd) and s1 is None and s2 is None:
+            for neg_idx in (0, 1):
+                negated = self._as_negation(operands[neg_idx])
+                product = self._as_product(operands[1 - neg_idx])
+                if negated is not None and product is not None:
+                    return fused("vfmsac", product[0], negated, product[1], product[2])
+
+        for prod_idx in (0, 1):
+            if (s1, s2)[1 - prod_idx] is not None:
+                continue  # a uniform addend stays a .vf addition
+            product = self._as_product(operands[prod_idx])
+            if product is None:
+                continue
+            form, x, y = product
+            if isinstance(expr, PsAdd):
+                stem = "vfmacc"
+            else:
+                stem = "vfmsac" if prod_idx == 0 else "vfnmsac"
+            return fused(stem, form, operands[1 - prod_idx], x, y)
+        return None
+
+    @staticmethod
+    def _as_negation(lowered: PsExpression) -> PsExpression | None:
+        """If `lowered` is ``vfmul_vf(v, -1)``: v."""
+        if (
+            isinstance(lowered, PsCall)
+            and isinstance(lowered.function, CFunction)
+            and lowered.function.name.startswith("__riscv_vfmul_vf_")
+            and isinstance(lowered.args[1], PsConstantExpr)
+            and lowered.args[1].constant.value == -1
+        ):
+            return lowered.args[0]
+        return None
 
     def _horizontal(
         self, expr: PsVecHorizontal, operands: Sequence[PsExpression]

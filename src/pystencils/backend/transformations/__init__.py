@@ -105,6 +105,7 @@ from .lower_to_c import LowerToC
 from .select_functions import SelectFunctions
 from .select_intrinsics import SelectIntrinsics
 from .insert_prefetches import InsertPrefetches
+from .hoist_row_pointers import HoistRowPointers
 
 __all__ = [
     "CanonicalizeSymbols",
@@ -129,4 +130,5 @@ __all__ = [
     "SelectFunctions",
     "SelectIntrinsics",
     "InsertPrefetches",
+    "HoistRowPointers",
 ]

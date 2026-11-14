@@ -7,6 +7,7 @@ which catches misspelled intrinsics without having to run anything.
 """
 
 import platform
+import re
 import shutil
 import subprocess
 
@@ -95,8 +96,111 @@ def test_float_arithmetic(dtype, sfx):
         [Assignment(c.center(), (a.center() + 2 * b.center()) / (a.center() - b[1, 0]))],
         rvv_config(dtype),
     )
-    for op in ("vfadd_vv", "vfmul_vv", "vfdiv_vv", "vfmv_v_f"):
+    #   a + 2 b and a - b[1, 0] (sympy: a + (-1) b) are multiply-adds with a scalar factor; the
+    #   division becomes a multiplication with the reciprocal 1 / (...) (vfrdiv: scalar / vector)
+    for op in ("vfmacc_vf", "vfrdiv_vf", "vfmul_vv"):
         assert f"__riscv_{op}_{sfx}(" in code
+
+
+def _vector_loop_ops(code: str, sfx: str) -> list[str]:
+    """The RVV operations (loads and stores excluded) of the first, i.e. the vectorized, loop."""
+    start = code.index("for(")
+    body = code[start : code.index("for(", start + 4)]
+    return [op for op in re.findall(rf"__riscv_(\w+?)_{sfx}\(", body) if not op.startswith(("vle", "vse"))]
+
+
+def _on_symbols(expr_fn, dtype="float64"):
+    """d = expr(x, y, z) with x, y, z loaded from fields first, as lbmpy's subexpressions are."""
+    a, b, c, d = fields(f"a, b, c, d: {dtype}[1D]")
+    x, y, z = sp.symbols("x y z")
+    return [
+        Assignment(x, a.center()),
+        Assignment(y, b.center()),
+        Assignment(z, c.center()),
+        Assignment(d.center(), expr_fn(x, y, z)),
+    ]
+
+
+@pytest.mark.parametrize(
+    "expr, ops",
+    [
+        (lambda x, y, z: x + 3, ["vfadd_vf"]),
+        (lambda x, y, z: x * 3, ["vfmul_vf"]),
+        (lambda x, y, z: 3 - x, ["vfrsub_vf"]),
+        (lambda x, y, z: x - y, ["vfsub_vv"]),  # two vectors stay .vv
+    ],
+)
+def test_scalar_operands_use_vf_forms(expr, ops):
+    assert _vector_loop_ops(rvv_code(_on_symbols(expr)), "f64m1") == ops
+
+
+@pytest.mark.parametrize(
+    "expr, op",
+    [
+        (lambda x, y, z: x * y + z, "vfmacc_vv"),
+        (lambda x, y, z: x * y - z, "vfmsac_vv"),
+        (lambda x, y, z: z - x * y, "vfnmsac_vv"),
+        (lambda x, y, z: 2 * x + z, "vfmacc_vf"),
+        (lambda x, y, z: 2 * x - z, "vfmsac_vf"),
+    ],
+)
+def test_fused_multiply_add(expr, op):
+    assert _vector_loop_ops(rvv_code(_on_symbols(expr)), "f64m1") == [op]
+
+
+def test_scalar_addend_is_not_fused():
+    #   An FMA would need the scalar 3 splatted into a vector register: product, then .vf addition
+    ops = _vector_loop_ops(rvv_code(_on_symbols(lambda x, y, z: x * y + 3)), "f64m1")
+    assert sorted(ops) == ["vfadd_vf", "vfmul_vv"]
+
+
+@pytest.mark.parametrize("dtype, ctype, sfx", [("float64", "double", "f64m1"), ("float32", "float", "f32m1")])
+def test_hoisted_constants_are_scalar_operands(dtype, ctype, sfx):
+    #   Rational constants are hoisted out of the loop as vector declarations. Each one gets a
+    #   scalar twin, which the loop passes to .vf operations instead of holding the constant in
+    #   a vector register.
+    a, b = fields(f"a, b: {dtype}[1D]")
+    code = rvv_code(
+        [Assignment(b.center(), a.center() * sp.Rational(1, 6) + sp.Rational(1, 7))], rvv_config(dtype)
+    )
+    twins = re.findall(rf"const {ctype} (\w+_s) = ", code)
+    assert len(twins) == 2
+    ops = _vector_loop_ops(code, sfx)
+    assert ops and all(op.endswith("_vf") for op in ops)
+    loop = code[code.index("for(") :]
+    assert all(t in loop for t in twins)
+    #   constant twins are hidden from the optimizer, so GCC keeps them in FP registers instead
+    #   of reloading them from the constant pool in every iteration
+    for t in twins:
+        assert re.search(rf"const {ctype} {t} = pystencils::runtime::rvv::in_register\(", code)
+
+
+def test_stencil_accesses_use_row_pointers():
+    #   Every contiguous access of the vector loop goes through its own row base pointer, declared
+    #   before the loop (`_data_src_row[ctr]`), so that no access adds a stencil offset such as
+    #   x - 1 to a shared pointer register in every iteration. The remainder loop is unchanged.
+    src, dst = fields("src, dst: float64[2D]")
+    code = rvv_code([Assignment(dst.center(), src[0, -1] + src[0, 1] + 2 * src[1, 0])])
+    m = re.search(r"for\(int64_t (ctr_\d)__1 = ", code)
+    ctr, start = m.group(1), m.start()
+    vloop = code[start : code.index("for(", start + 4)]
+    accesses = re.findall(r"__riscv_v[ls]e64_v_f64m1\(&(\w+)\[([^\]]*)\]", vloop)
+    assert len(accesses) == 4
+    assert all(re.fullmatch(r"_data_(src|dst)_row(__\d+)?", row) and idx == ctr for row, idx in accesses)
+    rows = re.findall(r"(_data_\w+_row\w*) = &_data_(src|dst)\[([^\]]*)\];", code)
+    assert sorted(f for _, f, _ in rows) == ["dst", "src", "src", "src"]
+    assert all(ctr not in idx and code.index(r) < start for r, _, idx in rows)
+    #   the x - 1 / x + 1 offsets moved into the row pointers
+    assert sorted(idx.split(" + ")[-1] for _, f, idx in rows if f == "src" and idx.endswith("LL")) == ["-1LL", "1LL"]
+
+
+def test_reassigned_vector_symbol_keeps_its_register():
+    #   A reduction accumulator starts as a broadcast of 0 but changes in the loop: it must not
+    #   be replaced by a scalar twin (that would add 0 to each load instead of accumulating)
+    f = fields("f: float64[1D]")
+    w = TypedSymbol("w", "float64")
+    code = rvv_code([reduction_assignment(w, ReductionOp.Add, f.center())])
+    assert re.search(r"(\w+) = __riscv_vfadd_vv_f64m1\(\1, ", code)
 
 
 @pytest.mark.parametrize("dtype, sfx", [("int64", "i64m1"), ("int32", "i32m1")])

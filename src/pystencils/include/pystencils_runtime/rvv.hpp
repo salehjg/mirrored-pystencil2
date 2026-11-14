@@ -161,6 +161,27 @@ namespace pystencils::runtime::rvv
     }
 
     /**
+     * SCALAR OPERANDS IN REGISTERS
+     *
+     * `in_register(x)` returns `x`, but the compiler can no longer see that the value is a
+     * constant. The code generator passes the scalar operands of `.vf` instructions that are
+     * compile-time constants through it. Otherwise GCC rematerializes every such operand
+     * inside the loop (`lla` + `flw` per use) instead of keeping it in one of the
+     * floating-point registers, which a vector loop leaves idle.
+     */
+    inline float in_register(float x)
+    {
+        __asm__("" : "+f"(x));
+        return x;
+    }
+
+    inline double in_register(double x)
+    {
+        __asm__("" : "+f"(x));
+        return x;
+    }
+
+    /**
      * RANDOM NUMBER GENERATION
      *
      * Same contract as `pystencils::runtime::x86::random`: counters come in as vectors of

@@ -308,6 +308,8 @@ class DefaultKernelCreationDriver:
 
     def _lowering(self, kernel_ast: PsBlock) -> PsBlock:
         if isinstance(self._platform, GenericVectorCpu):
+            kernel_ast = self._platform.prepare_vector_loops(kernel_ast)
+
             prefetch_distance = self._cfg.cpu.vectorize.get_option("prefetch_distance")
             if prefetch_distance:
                 kernel_ast = self._platform.insert_prefetches(kernel_ast, prefetch_distance)

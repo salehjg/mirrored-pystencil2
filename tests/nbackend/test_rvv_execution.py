@@ -12,6 +12,7 @@ Skipped unless the host exposes `Target.RISCV_RVV`.
 """
 
 import numpy as np
+import sympy as sp
 import pytest
 
 import pystencils as ps
@@ -76,6 +77,40 @@ def test_float_to_int_truncates(src, dst):
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float64"])
+def test_vf_forms_and_fma_match_numpy(dtype):
+    """Scalar (.vf) operands, reversed forms and fused multiply-adds compute what they should.
+
+    One output per form: sympy would merge the terms of a combined expression."""
+    a, b, c = fields(f"a, b, c: {dtype}[1D]")
+    x, y, z = sp.symbols("x y z")
+    forms = {
+        "vfrsub_vf": (3 - x, lambda x, y, z: 3 - x),
+        "vfmsac_vv": (x * y - z, lambda x, y, z: x * y - z),
+        "vfnmsac_vv": (z - x * y, lambda x, y, z: z - x * y),
+        "vfmacc_vv": (x * y + z, lambda x, y, z: x * y + z),
+        "vfmacc_vf": (2 * x + z, lambda x, y, z: 2 * x + z),
+        "vfmsac_vf": (2 * x - z, lambda x, y, z: 2 * x - z),
+        "vfadd_vf": (x * sp.Rational(1, 7) + 3, lambda x, y, z: x / 7 + 3),
+    }
+    outs = fields(", ".join(f"d{i}" for i in range(len(forms))) + f": {dtype}[1D]")
+    asms = [Assignment(x, a.center()), Assignment(y, b.center()), Assignment(z, c.center())]
+    asms += [Assignment(d.center(), expr) for d, (expr, _) in zip(outs, forms.values())]
+    kernel = ps.create_kernel(asms, make_config(Target.RISCV_RVV, dtype))
+    code = kernel.get_c_code()
+    for op in forms:
+        assert f"__riscv_{op}_" in code
+
+    rng = np.random.default_rng(5)
+    av, bv, cv = (rng.random(203).astype(dtype) + 0.5 for _ in range(3))
+    results = {f"d{i}": np.zeros_like(av) for i in range(len(forms))}
+    kernel.compile()(a=av, b=bv, c=cv, **results)
+    #   FMAs round once, numpy twice: allow a few ulps of the operands (x y - z may nearly cancel)
+    tol = 16 * np.finfo(dtype).eps
+    for i, (_, ref) in enumerate(forms.values()):
+        np.testing.assert_allclose(results[f"d{i}"], ref(av, bv, cv), rtol=tol, atol=tol)
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
 def test_prefetch_does_not_change_results(dtype):
     """Software prefetches are hints: the kernel output must be bit-identical."""
     f, g = fields(f"f, g: {dtype}[2D]")
@@ -92,3 +127,25 @@ def test_prefetch_does_not_change_results(dtype):
         kernel.compile()(f=src, g=dst)
         results.append(dst)
     np.testing.assert_array_equal(results[0], results[1])
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+def test_stencil_row_pointers_match_generic_cpu(dtype):
+    #   Every access of the vector loop goes through a row base pointer (HoistRowPointers):
+    #   neighbours at +-1 along all axes, the innermost one included, with an extent that also
+    #   runs the scalar remainder loop. The scalar GenericCPU kernel is the reference.
+    src, dst = fields(f"src, dst: {dtype}[3D]")
+    offsets = [(0, 0, 0), (0, 0, -1), (0, 0, 1), (0, -1, 0), (1, 0, 1), (-1, 1, -1)]
+    rhs = sum((k + 1) * src[off] for k, off in enumerate(offsets))
+    asms = [Assignment(dst.center(), rhs)]
+    rng = np.random.default_rng(42)
+    src_arr = rng.random((7, 9, 23)).astype(dtype)
+    results = {}
+    for target in (Target.GenericCPU, Target.RISCV_RVV):
+        kernel = ps.create_kernel(asms, make_config(target, dtype)).compile()
+        dst_arr = np.zeros_like(src_arr)
+        kernel(src=src_arr, dst=dst_arr)
+        results[target] = dst_arr
+    rtol = 1e-6 if dtype == "float32" else 1e-14
+    np.testing.assert_allclose(results[Target.RISCV_RVV], results[Target.GenericCPU], rtol=rtol)
+    assert np.count_nonzero(results[Target.RISCV_RVV]) == 5 * 7 * 21

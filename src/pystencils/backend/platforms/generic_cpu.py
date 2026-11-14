@@ -175,6 +175,11 @@ class GenericVectorCpu(GenericCpu, ABC):
         """Return an instance of a subclass of `SelectIntrinsics`
         to perform vector intrinsic selection for this platform."""
 
+    def prepare_vector_loops(self, kernel_ast: PsBlock) -> PsBlock:
+        """Platform-specific restructuring of the vectorized loops before intrinsic selection
+        (and before software prefetches are inserted). The default leaves them unchanged."""
+        return kernel_ast
+
     def insert_prefetches(self, kernel_ast: PsBlock, distance_bytes: int) -> PsBlock:
         """Insert software prefetches into the innermost vector loops (see `InsertPrefetches`).
 
