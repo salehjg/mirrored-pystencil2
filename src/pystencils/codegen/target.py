@@ -32,6 +32,8 @@ class Target(Flag):
 
     _RISCV = auto()
     _RVV = auto()
+    _VLEN128 = auto()
+    _VLEN256 = auto()
 
     _GPU = auto()
 
@@ -83,13 +85,23 @@ class Target(Flag):
     ARM_SVE = _CPU | _VECTOR | _ARM | _SVE
     """ARM architecture with SVE vector extensions"""
 
-    RISCV_RVV = _CPU | _VECTOR | _RISCV | _RVV
-    """RISC-V architecture with the ratified V vector extension (RVV 1.0).
+    RISCV_RVV256 = _CPU | _VECTOR | _RISCV | _RVV | _VLEN256
+    """RISC-V architecture with the ratified V vector extension (RVV 1.0) and 256-bit vector
+    registers (``VLEN = 256``, e.g. the SpacemiT K1).
 
-    Treated like a fixed-width target (cf. `X86_AVX`): the code generator assumes a
-    hardware vector register width of exactly ``VLEN = 256`` bits (SpacemiT K1) and
-    emits vector-length-specific (VLS) code. Kernels require hardware with VLEN >= 256.
+    Treated like a fixed-width target (cf. `X86_AVX`): the code generator emits
+    vector-length-specific (VLS) code for this VLEN. Kernels require hardware with VLEN >= 256.
     """
+
+    RISCV_RVV128 = _CPU | _VECTOR | _RISCV | _RVV | _VLEN128
+    """Like `RISCV_RVV256`, for 128-bit vector registers (``VLEN = 128``, e.g. the Sophgo SG2044).
+
+    The generated code is also correct on hardware with a larger VLEN (it then uses part of
+    each register). Both RVV targets share one backend; see `Target.rvv_vlen`.
+    """
+
+    RISCV_RVV = RISCV_RVV256
+    """Alias of `RISCV_RVV256`, the original (and default) RVV target."""
 
     CurrentGPU = _GPU | _AUTOMATIC
     """Auto-best GPU target.
@@ -143,6 +155,12 @@ class Target(Flag):
         """
         return Target._GPU in self
 
+    def rvv_vlen(self) -> int:
+        """Vector register width (VLEN) in bits of a RISC-V Vector target."""
+        if Target._RVV not in self:
+            raise ValueError(f"{self} is no RISC-V Vector target.")
+        return 128 if Target._VLEN128 in self else 256
+
     def default_vector_lanes(self, dtype: PsScalarType) -> int:
         if not self.is_vector_cpu():
             raise ValueError("This target is no vector CPU target.")
@@ -150,10 +168,10 @@ class Target(Flag):
         assert dtype.itemsize is not None
 
         match self:
-            case Target.X86_SSE | Target.ARM_NEON | Target.ARM_NEON_FP16:
+            case Target.X86_SSE | Target.ARM_NEON | Target.ARM_NEON_FP16 | Target.RISCV_RVV128:
                 return 128 // (dtype.itemsize * 8)
-            case Target.X86_AVX | Target.RISCV_RVV:
-                #   RVV: VLEN is hardcoded to 256 bits, so lanes == one full register (LMUL=1)
+            case Target.X86_AVX | Target.RISCV_RVV256:
+                #   RVV: one full vector register (LMUL = 1); `cpu.vectorize.rvv_lmul` multiplies it
                 return 256 // (dtype.itemsize * 8)
             case Target.X86_AVX512 | Target.X86_AVX512_FP16:
                 return 512 // (dtype.itemsize * 8)
@@ -282,6 +300,9 @@ def _available_vector_targets() -> tuple[Target, ...]:
                 f"Unable to determine ARM architecture features on system {platform.system()}"
             )
     elif machine_spec == "riscv64":
+        #   Linux does not report the vector length, so `CurrentCPU` assumes the default RVV
+        #   target (VLEN 256). Machines with VLEN 128 need `Target.RISCV_RVV128` set explicitly
+        #   (waLBerla measures the VLEN at configure time and does so).
         if _riscv_has_rvv():
             targets.append(Target.RISCV_RVV)
     else:

@@ -1,27 +1,31 @@
-"""RISC-V Vector extension (RVV 1.0) platform -- vector-length-specific, VLEN = 256.
+"""RISC-V Vector extension (RVV 1.0) platform -- vector-length-specific, VLEN 128 or 256.
 
 This backend deliberately follows the assumptions of the x86/AVX backend (`x86.py`)
 instead of exploiting RVV's scalable programming model:
 
-- The hardware vector register width is a codegen-time constant, `RVV_VLEN` = 256 bits
-  (the SpacemiT K1). Like AVX, a vector type is therefore determined by its width in
-  bits: a full 256-bit vector is one register (LMUL ``m1``, AVX: ``__m256*``), a
-  128-bit vector is half a register (LMUL ``mf2``, AVX: ``__m128*``). Wider vectors
-  are rejected, just like on AVX; there is no register grouping (``m2``, ``m4``, ...).
+- The hardware vector register width VLEN is a codegen-time constant, chosen by the target:
+  256 bits for `Target.RISCV_RVV256` (e.g. the SpacemiT K1), 128 bits for
+  `Target.RISCV_RVV128` (e.g. the Sophgo SG2044). Like on x86 (SSE, AVX, AVX-512 share
+  `X86VectorCpu`), both targets share this one platform. A vector type is determined by its
+  width in bits: a vector of VLEN bits is one register (LMUL ``m1``), half of it is ``mf2``,
+  twice ``m2``, and so on. By default vectors are one register wide;
+  `cpu.vectorize.rvv_lmul` groups 2 or 4 registers per vector.
 - The loop structure is the generic one (peel + vectorized block loop + scalar
   remainder). Every RVV intrinsic takes an explicit active length ``vl``; we always pass
-  the literal lane count. At VLEN = 256 the lane count of every legal vector type equals
-  its VLMAX, so this is exactly "one full (fractional) register per operation".
+  the literal lane count, which equals VLMAX of every vector type at the target's VLEN, so
+  this is exactly "one full (fractional or grouped) register per operation".
 - Only floating-point and signed integer element types are supported (as on x86).
 - What x86 implements with helpers in its runtime headers (``_mm256_set_*`` and the
   horizontal reductions), we implement with helpers in ``pystencils_runtime/rvv.hpp``.
 
-Running the generated code on hardware with VLEN < 256 is NOT supported (operations
-would silently process fewer lanes). ``rvv.hpp`` refuses to compile unless the compiler
-is told VLEN >= 256 (``-march=rv64gcv_zvl256b``), which is the flag the JIT passes.
+Running the generated code on hardware with a smaller VLEN than the target's is NOT
+supported (operations would silently process fewer lanes); on a larger VLEN it is correct.
+The runtime header refuses to compile unless the compiler is told VLEN >= the target's
+(``-march=rv64gcv_zvl<VLEN>b``, which is the flag the JIT passes).
 """
 
 from __future__ import annotations
+from fractions import Fraction
 from typing import Sequence, cast
 
 from ..ast import PsAstNode
@@ -69,11 +73,13 @@ from .generic_cpu import GenericVectorCpu
 
 
 RVV_VLEN = 256
-"""Hardware vector register width (VLEN) in bits assumed by the code generator.
+"""Default vector register width (VLEN) in bits: the VLEN of `Target.RISCV_RVV` (= `Target.RISCV_RVV256`).
 
-Hardcoded on purpose: fixing VLEN turns RVV into a fixed-width SIMD ISA like AVX,
-so none of the vector-length-agnostic machinery is needed. 256 matches the SpacemiT K1.
+Fixing VLEN at codegen time turns RVV into a fixed-width SIMD ISA like AVX, so none of the
+vector-length-agnostic machinery is needed. The other supported value is 128 (`Target.RISCV_RVV128`).
 """
+
+SUPPORTED_VLENS = (128, 256)
 
 #   C types of the scalar arguments of RVV intrinsics on rv64
 _SIZE_T = UInt(64)  # the active vector length `vl`
@@ -87,24 +93,30 @@ _RUNTIME_NS = "pystencils::runtime::rvv"
 #   -------------------------------------------------------------------------------------
 
 
-def _lmul(vtype: PsVectorType) -> str:
+#   Register-group multipliers by vector width / VLEN
+_LMULS = {
+    Fraction(1, 8): "mf8", Fraction(1, 4): "mf4", Fraction(1, 2): "mf2",
+    Fraction(1): "m1", Fraction(2): "m2", Fraction(4): "m4", Fraction(8): "m8",
+}
+
+
+def _lmul(vtype: PsVectorType, vlen: int = RVV_VLEN) -> str:
     """Register-group multiplier (LMUL) of a vector type, as used in intrinsic names.
 
-    With a fixed VLEN this is just ``width / VLEN``. We only allow the two widths the
-    AVX backend allows (256 and 128 bits). Fractional LMUL additionally requires
-    ``SEW <= LMUL * ELEN`` (ELEN = 64), so e.g. ``vfloat64mf2_t`` does not exist.
+    With a fixed VLEN this is just ``width / VLEN``, a power of two from 1/8 to 8. Fractional
+    LMUL additionally requires ``SEW <= LMUL * ELEN`` (ELEN = 64), so e.g. ``vfloat64mf2_t``
+    does not exist. At the default LMUL 1 a kernel uses ``m1`` and, for casts to narrower
+    elements, ``mf2``; `cpu.vectorize.rvv_lmul` produces the larger groups.
     """
-    match vtype.width:
-        case w if w == RVV_VLEN:
-            return "m1"
-        case w if w == RVV_VLEN // 2 and vtype.scalar_type.width <= 32:
-            return "mf2"
-        case _:
-            raise MaterializationError(
-                f"RVV (VLEN={RVV_VLEN}) does not support vector type {vtype}: "
-                f"vectors must be {RVV_VLEN} bits wide, or {RVV_VLEN // 2} bits "
-                "wide with elements of at most 32 bits."
-            )
+    ratio = Fraction(vtype.width, vlen)
+    name = _LMULS.get(ratio)
+    if name is None or (ratio < 1 and vtype.scalar_type.width > 64 * ratio):
+        raise MaterializationError(
+            f"RVV (VLEN={vlen}) does not support vector type {vtype}: its width must be a "
+            f"power of two from {vlen // 8} to {vlen * 8} bits, and below {vlen} bits only "
+            "for narrow enough elements (element bits <= 64 * width / VLEN)."
+        )
+    return name
 
 
 def _elem(stype: PsScalarType) -> tuple[str, int]:
@@ -118,32 +130,42 @@ def _elem(stype: PsScalarType) -> tuple[str, int]:
             raise MaterializationError(f"RVV backend does not support scalar type {stype}")
 
 
-def _sfx(vtype: PsVectorType) -> str:
+def _sfx(vtype: PsVectorType, vlen: int = RVV_VLEN) -> str:
     """Type suffix of intrinsic names, e.g. ``f64m1`` or ``i32mf2``."""
     kind, width = _elem(vtype.scalar_type)
-    return f"{kind[0]}{width}{_lmul(vtype)}"
+    return f"{kind[0]}{width}{_lmul(vtype, vlen)}"
 
 
-def _rvv_type(vtype: PsVectorType, tuple_size: int | None = None) -> PsCustomType:
+def _rvv_type(vtype: PsVectorType, tuple_size: int | None = None, vlen: int = RVV_VLEN) -> PsCustomType:
     """C type of a vector (``vfloat64m1_t``) or of a vector tuple (``vfloat32m1x4_t``)."""
     kind, width = _elem(vtype.scalar_type)
     tuple_part = "" if tuple_size is None else f"x{tuple_size}"
-    return PsCustomType(f"v{kind}{width}{_lmul(vtype)}{tuple_part}_t")
+    return PsCustomType(f"v{kind}{width}{_lmul(vtype, vlen)}{tuple_part}_t")
 
 
 class RvvCpu(GenericVectorCpu):
-    """Platform modelling the RISC-V Vector extension (RVV 1.0) at a fixed VLEN of 256 bits.
+    """Platform modelling the RISC-V Vector extension (RVV 1.0) at a fixed VLEN (128 or 256 bits).
 
     Intrinsics reference: https://github.com/riscv-non-isa/rvv-intrinsic-doc
     """
 
-    def __init__(self, ctx: KernelCreationContext):
+    def __init__(self, ctx: KernelCreationContext, vlen: int = RVV_VLEN):
         super().__init__(ctx)
+        if vlen not in SUPPORTED_VLENS:
+            raise MaterializationError(f"RVV: unsupported VLEN {vlen}, supported are {SUPPORTED_VLENS}")
+        self._vlen = vlen
+
+    @property
+    def vlen(self) -> int:
+        return self._vlen
 
     @property
     def required_headers(self) -> set[str]:
+        #   The header for other VLENs sets the VLEN for rvv.hpp (its guard, the reduction lane
+        #   counts), then includes it. The default keeps including rvv.hpp itself.
+        header = "rvv.hpp" if self._vlen == RVV_VLEN else f"rvv_vlen{self._vlen}.hpp"
         return super().required_headers | {
-            '"pystencils_runtime/rvv.hpp"',
+            f'"pystencils_runtime/{header}"',
         }
 
     def get_intrinsic_selector(
@@ -154,7 +176,7 @@ class RvvCpu(GenericVectorCpu):
             raise MaterializationError(
                 "`__builtin_convertvector` is not supported on the RVV platform."
             )
-        return SelectIntrinsicsRvv(self._ctx)
+        return SelectIntrinsicsRvv(self._ctx, self._vlen)
 
     def prepare_vector_loops(self, kernel_ast: PsBlock) -> PsBlock:
         """One row base pointer per contiguous access of the innermost loops (`HoistRowPointers`).
@@ -206,8 +228,9 @@ class SelectIntrinsicsRvv(SelectIntrinsics):
     leaves idle.
     """
 
-    def __init__(self, ctx: KernelCreationContext):
+    def __init__(self, ctx: KernelCreationContext, vlen: int = RVV_VLEN):
         super().__init__(ctx)
+        self._vlen = vlen
 
         typify = Typifier(ctx)
         elim_constants = EliminateConstants(ctx)
@@ -311,6 +334,12 @@ class SelectIntrinsicsRvv(SelectIntrinsics):
     #   Helpers
     #   ---------------------------------------------------------------------------------
 
+    def _sfx(self, vtype: PsVectorType) -> str:
+        return _sfx(vtype, self._vlen)
+
+    def _rvv_type(self, vtype: PsVectorType, tuple_size: int | None = None) -> PsCustomType:
+        return _rvv_type(vtype, tuple_size, self._vlen)
+
     @staticmethod
     def _in_register(scalar: PsExpression, stype: PsScalarType) -> PsExpression:
         """``pystencils::runtime::rvv::in_register(scalar)``: the same value, opaque to the optimizer."""
@@ -338,9 +367,9 @@ class SelectIntrinsicsRvv(SelectIntrinsics):
         """Splat a scalar into all lanes (AVX: ``_mm256_set1_*``)."""
         stem = "vfmv_v_f" if vtype.scalar_type.is_float() else "vmv_v_x"
         return self._call(
-            f"__riscv_{stem}_{_sfx(vtype)}",
+            f"__riscv_{stem}_{self._sfx(vtype)}",
             (vtype.scalar_type, _SIZE_T),
-            _rvv_type(vtype),
+            self._rvv_type(vtype),
             scalar,
             self._vl(vtype),
         )
@@ -354,14 +383,14 @@ class SelectIntrinsicsRvv(SelectIntrinsics):
     ) -> PsCustomType:
         match vector_type:
             case PsVectorType():
-                return _rvv_type(vector_type)
+                return self._rvv_type(vector_type)
 
             case PsShortArrayType(btype, num_elements) if isinstance(
                 btype, PsVectorType
             ):
                 #   x86 wraps short arrays of vectors in structs; RVV vector types are
                 #   sizeless and cannot be struct members, but RVV has native tuple types.
-                return _rvv_type(btype, num_elements)
+                return self._rvv_type(btype, num_elements)
 
             case _:
                 raise MaterializationError(
@@ -384,9 +413,9 @@ class SelectIntrinsicsRvv(SelectIntrinsics):
         #   `_mm256_set_*`. RVV has no such intrinsic, the helper loads from a stack array.
         args = [PsConstantExpr(PsConstant(v, stype)) for v in values]
         return self._call(
-            f"{_RUNTIME_NS}::set_{_sfx(vtype)}",
+            f"{_RUNTIME_NS}::set_{self._sfx(vtype)}",
             (stype,) * len(args),
-            _rvv_type(vtype),
+            self._rvv_type(vtype),
             *args,
         )
 
@@ -428,9 +457,9 @@ class SelectIntrinsicsRvv(SelectIntrinsics):
                     f"Unable to select RVV operation intrinsic for {type(expr)}"
                 )
 
-        rtype = _rvv_type(vtype)
+        rtype = self._rvv_type(vtype)
         return self._call(
-            f"__riscv_{stem}_{_sfx(vtype)}",
+            f"__riscv_{stem}_{self._sfx(vtype)}",
             (rtype, rtype, _SIZE_T),
             rtype,
             *operands,
@@ -461,9 +490,9 @@ class SelectIntrinsicsRvv(SelectIntrinsics):
         return None
 
     def _vf(self, stem: str, vtype: PsVectorType, vec: PsExpression, scalar: PsExpression) -> PsExpression:
-        rtype = _rvv_type(vtype)
+        rtype = self._rvv_type(vtype)
         return self._call(
-            f"__riscv_{stem}_{_sfx(vtype)}", (rtype, vtype.scalar_type, _SIZE_T), rtype, vec, scalar, self._vl(vtype)
+            f"__riscv_{stem}_{self._sfx(vtype)}", (rtype, vtype.scalar_type, _SIZE_T), rtype, vec, scalar, self._vl(vtype)
         )
 
     @staticmethod
@@ -489,12 +518,12 @@ class SelectIntrinsicsRvv(SelectIntrinsics):
         """``a * b + c`` -> vfmacc(c, a, b), ``a * b - c`` -> vfmsac(c, a, b), ``c - a * b`` -> vfnmsac(c, a, b).
 
         ``a * b - c`` also arrives as ``(-1) * c + a * b``, which is how sympy writes it."""
-        rtype = _rvv_type(vtype)
+        rtype = self._rvv_type(vtype)
 
         def fused(stem: str, form: str, acc: PsExpression, x: PsExpression, y: PsExpression) -> PsExpression:
             x_type = vtype.scalar_type if form == "vf" else rtype
             return self._call(
-                f"__riscv_{stem}_{form}_{_sfx(vtype)}", (rtype, x_type, rtype, _SIZE_T), rtype, acc, x, y, self._vl(vtype)
+                f"__riscv_{stem}_{form}_{self._sfx(vtype)}", (rtype, x_type, rtype, _SIZE_T), rtype, acc, x, y, self._vl(vtype)
             )
 
         if isinstance(expr, PsAdd) and s1 is None and s2 is None:
@@ -548,15 +577,15 @@ class SelectIntrinsicsRvv(SelectIntrinsics):
 
         op = ReductionOp.Add if expr.reduction_op == ReductionOp.Sub else expr.reduction_op
         return self._call(
-            f"{_RUNTIME_NS}::horizontal_{op.name.lower()}_{_sfx(vtype)}",
-            (stype, _rvv_type(vtype)),
+            f"{_RUNTIME_NS}::horizontal_{op.name.lower()}_{self._sfx(vtype)}",
+            (stype, self._rvv_type(vtype)),
             stype,
             *operands,
         )
 
     #   Conversion intrinsics, keyed by (source is float, target is float).
-    #   Legal vector widths are 128 and 256 bits at the same lane count, so a cast
-    #   changes the element width by at most a factor of two: one intrinsic suffices.
+    #   All vectors of a kernel have the same lane count and the element types differ by at most
+    #   a factor of two in width, so one intrinsic suffices (e.g. f64 m1 <-> f32 mf2).
     #   Float -> int always uses the `rtz` (round towards zero) variant: C truncation.
     _SAME_WIDTH_CVT = {
         (True, False): "vfcvt_rtz_x_f_v",
@@ -599,9 +628,9 @@ class SelectIntrinsicsRvv(SelectIntrinsics):
             )
 
         return self._call(
-            f"__riscv_{table[key]}_{_sfx(target)}",
-            (_rvv_type(source), _SIZE_T),
-            _rvv_type(target),
+            f"__riscv_{table[key]}_{self._sfx(target)}",
+            (self._rvv_type(source), _SIZE_T),
+            self._rvv_type(target),
             operand,
             self._vl(target),
         )
@@ -616,8 +645,8 @@ class SelectIntrinsicsRvv(SelectIntrinsics):
         assert isinstance(expr.function, PsMathFunction)
 
         vtype = cast(PsVectorType, expr.get_dtype())
-        rtype = _rvv_type(vtype)
-        sfx = _sfx(vtype)
+        rtype = self._rvv_type(vtype)
+        sfx = self._sfx(vtype)
         vl = self._vl(vtype)
         is_float = vtype.scalar_type.is_float()
 
@@ -661,18 +690,18 @@ class SelectIntrinsicsRvv(SelectIntrinsics):
         stype = vtype.scalar_type
         ptr_type = PsPointerType(stype, const=True)
         addr = PsAddressOf(PsMemAcc(acc.pointer, acc.offset))
-        name = f"vle{stype.width}_v_{_sfx(vtype)}"
+        name = f"vle{stype.width}_v_{self._sfx(vtype)}"
 
         if acc.stride is None:
             return self._call(
-                f"__riscv_{name}", (ptr_type, _SIZE_T), _rvv_type(vtype), addr, self._vl(vtype)
+                f"__riscv_{name}", (ptr_type, _SIZE_T), self._rvv_type(vtype), addr, self._vl(vtype)
             )
         else:
             #   Native strided load (x86 needs a gather here).
             return self._call(
-                f"__riscv_vlse{stype.width}_v_{_sfx(vtype)}",
+                f"__riscv_vlse{stype.width}_v_{self._sfx(vtype)}",
                 (ptr_type, _PTRDIFF_T, _SIZE_T),
-                _rvv_type(vtype),
+                self._rvv_type(vtype),
                 addr,
                 self._byte_stride(acc),
                 self._vl(vtype),
@@ -685,11 +714,11 @@ class SelectIntrinsicsRvv(SelectIntrinsics):
         stype = vtype.scalar_type
         ptr_type = PsPointerType(stype)
         addr = PsAddressOf(PsMemAcc(acc.pointer, acc.offset))
-        rtype = _rvv_type(vtype)
+        rtype = self._rvv_type(vtype)
 
         if acc.stride is None:
             return self._call(
-                f"__riscv_vse{stype.width}_v_{_sfx(vtype)}",
+                f"__riscv_vse{stype.width}_v_{self._sfx(vtype)}",
                 (ptr_type, rtype, _SIZE_T),
                 PsVoidType(),
                 addr,
@@ -699,7 +728,7 @@ class SelectIntrinsicsRvv(SelectIntrinsics):
         else:
             #   Native strided store (x86 needs an AVX-512 scatter here).
             return self._call(
-                f"__riscv_vsse{stype.width}_v_{_sfx(vtype)}",
+                f"__riscv_vsse{stype.width}_v_{self._sfx(vtype)}",
                 (ptr_type, _PTRDIFF_T, rtype, _SIZE_T),
                 PsVoidType(),
                 addr,
@@ -716,6 +745,11 @@ class SelectIntrinsicsRvv(SelectIntrinsics):
         self, expr: PsCall, args: Sequence[PsExpression], sc: SelectionContext
     ) -> PsExpression:
         #   -> pystencils::runtime::rvv::random::philox_float{32,64}(ctr..., key...)
+        #   The Philox kernels in rvv.hpp work on single registers.
+        result_type = deconstify(expr.get_dtype())
+        if isinstance(result_type, PsShortArrayType) and isinstance(result_type.base_type, PsVectorType):
+            if _lmul(result_type.base_type, self._vlen) != "m1":
+                raise MaterializationError("RVV random number generation needs `cpu.vectorize.rvv_lmul` = 1")
         return self._common_rng_engine_intrinsic(expr, args, sc, namespace="rvv")
 
     def subscript_intrinsic(
@@ -733,9 +767,9 @@ class SelectIntrinsicsRvv(SelectIntrinsics):
         n = arr_type.num_elements
 
         return self._call(
-            f"__riscv_vget_v_{_sfx(btype)}x{n}_{_sfx(btype)}",
-            (_rvv_type(btype, n), _SIZE_T),
-            _rvv_type(btype),
+            f"__riscv_vget_v_{self._sfx(btype)}x{n}_{self._sfx(btype)}",
+            (self._rvv_type(btype, n), _SIZE_T),
+            self._rvv_type(btype),
             arr,
             indices[0],
         )

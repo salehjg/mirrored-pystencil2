@@ -430,10 +430,10 @@ class DefaultKernelCreationDriver:
                 from ..backend.platforms.sve import SveCpu
 
                 return SveCpu(self._ctx)
-            elif self._target == Target.RISCV_RVV:
+            elif Target._RVV in self._target:
                 from ..backend.platforms.rvv import RvvCpu
 
-                return RvvCpu(self._ctx)
+                return RvvCpu(self._ctx, vlen=self._target.rvv_vlen())
             elif self._target == Target.GenericCPU:
                 return GenericCpu(self._ctx)
             else:

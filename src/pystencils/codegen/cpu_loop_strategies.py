@@ -61,10 +61,19 @@ class DefaultCpuLoopStrategies:
         if enable_vec:
             self._apply_vectorization_assumptions()
 
+            rvv_lmul: int | None = vec_options.get_option("rvv_lmul")
+            if rvv_lmul is not None:
+                if Target._RVV not in self._target:
+                    raise ValueError(f"`cpu.vectorize.rvv_lmul` needs a RISC-V Vector target, not {self._target}")
+                if rvv_lmul not in (1, 2, 4):
+                    raise ValueError(f"`cpu.vectorize.rvv_lmul` must be 1, 2 or 4, not {rvv_lmul}")
+                if vec_lanes is not None:
+                    raise ValueError("Set either `cpu.vectorize.lanes` or `cpu.vectorize.rvv_lmul`, not both")
+
             if vec_lanes is None:
                 vec_lanes = self._target.default_vector_lanes(
                     cast(PsScalarType, self._ctx.default_dtype)
-                )
+                ) * (rvv_lmul or 1)
 
         omp_kwargs = self._get_parallel_loop_kwargs()
 

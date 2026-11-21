@@ -256,6 +256,15 @@ class VectorizationOptions(ConfigBase):
     operation contained in the kernel with the given number of lanes, an error will be raised.
     """
 
+    rvv_lmul: BasicOption[int] = BasicOption()
+    """Register grouping (LMUL) of the vectors on the RISC-V Vector targets: 1, 2 or 4.
+
+    One vector then spans ``rvv_lmul`` registers, so it holds ``rvv_lmul`` times the default
+    number of lanes (`Target.default_vector_lanes`). Larger LMUL means fewer loop iterations
+    but fewer registers (32 / LMUL). `None` (the default) means 1. Cannot be combined with `lanes`,
+    which fixes the vector width directly.
+    """
+
     use_nontemporal_stores: BasicOption[bool | Collection[str | Field]] = BasicOption(
         False
     )
@@ -284,7 +293,7 @@ class VectorizationOptions(ConfigBase):
     prefetcher can follow, e.g. D3Q19 lattice Boltzmann sweeps (19 read and 23 write streams)
     on the SpacemiT X60, where it doubles the throughput at a distance of 128 bytes.
 
-    Currently only supported on `Target.RISCV_RVV`.
+    Currently only supported on the RISC-V Vector targets (`Target.RISCV_RVV256`, `Target.RISCV_RVV128`).
     """
 
     assume_inner_stride_one: BasicOption[bool] = BasicOption(False)

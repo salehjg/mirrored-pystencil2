@@ -1,4 +1,4 @@
-"""Code generation tests for the RVV platform (VLS, VLEN = 256).
+"""Code generation tests for the RVV platform (VLS, VLEN 256 and 128, LMUL 1 to 4).
 
 These only generate code and inspect it, so they run on any host. The last test
 additionally compiles the generated code with a RISC-V compiler, if one is available
@@ -25,11 +25,13 @@ from pystencils.types import PsVectorType
 from pystencils.types.quick import Fp, SInt, UInt
 
 
-def rvv_config(default_dtype="float64", **kwargs) -> ps.CreateKernelConfig:
-    """Vectorized RVV config; lanes default to one full 256-bit register (like AVX)."""
-    cfg = ps.CreateKernelConfig(target=Target.RISCV_RVV, default_dtype=default_dtype, **kwargs)
+def rvv_config(default_dtype="float64", target=Target.RISCV_RVV, lmul=None, **kwargs) -> ps.CreateKernelConfig:
+    """Vectorized RVV config; lanes default to one full register (like AVX), times `lmul`."""
+    cfg = ps.CreateKernelConfig(target=target, default_dtype=default_dtype, **kwargs)
     cfg.cpu.vectorize.enable = True
     cfg.cpu.vectorize.assume_inner_stride_one = True
+    if lmul is not None:
+        cfg.cpu.vectorize.rvv_lmul = lmul
     return cfg
 
 
@@ -59,18 +61,39 @@ def test_vector_types(stype, lanes, expected):
 
 
 @pytest.mark.parametrize(
-    "stype, lanes",
+    "stype, lanes, vlen, expected",
     [
-        (Fp(64), 2),  # 128 bit of f64 would be `vfloat64mf2_t`, which does not exist
-        (Fp(64), 8),  # 512 bit: wider than a register (no LMUL > 1, as on AVX)
-        (Fp(32), 16),
-        (UInt(32), 8),  # unsigned: not supported (as on x86)
-        (Fp(16), 16),
+        #   VLEN 128: the same type names hold half the lanes
+        (Fp(64), 2, 128, "vfloat64m1_t"),
+        (Fp(32), 4, 128, "vfloat32m1_t"),
+        (Fp(32), 2, 128, "vfloat32mf2_t"),
+        (SInt(16), 8, 128, "vint16m1_t"),
+        #   register groups (cpu.vectorize.rvv_lmul) and narrow fractional registers
+        (Fp(64), 8, 256, "vfloat64m2_t"),
+        (Fp(32), 32, 256, "vfloat32m4_t"),
+        (Fp(64), 4, 128, "vfloat64m2_t"),
+        (Fp(64), 8, 128, "vfloat64m4_t"),
+        (SInt(16), 4, 256, "vint16mf4_t"),
     ],
 )
-def test_unsupported_vector_types(stype, lanes):
+def test_vector_types_vlen_and_groups(stype, lanes, vlen, expected):
+    assert _rvv_type(PsVectorType(stype, lanes), vlen=vlen).c_string() == expected
+
+
+@pytest.mark.parametrize(
+    "stype, lanes, vlen",
+    [
+        (Fp(64), 2, 256),  # 128 bit of f64 would be `vfloat64mf2_t`, which does not exist
+        (Fp(64), 1, 128),  # the same at VLEN 128
+        (Fp(64), 64, 256),  # 4096 bit: more than eight registers
+        (Fp(32), 3, 256),  # not a power-of-two fraction of a register
+        (UInt(32), 8, 256),  # unsigned: not supported (as on x86)
+        (Fp(16), 16, 256),
+    ],
+)
+def test_unsupported_vector_types(stype, lanes, vlen):
     with pytest.raises(MaterializationError):
-        _rvv_type(PsVectorType(stype, lanes))
+        _rvv_type(PsVectorType(stype, lanes), vlen=vlen)
 
 
 def test_default_lanes_and_header():
@@ -82,6 +105,60 @@ def test_default_lanes_and_header():
     assert "__riscv_vle64_v_f64m1(" in code and "4uLL)" in code
     assert "__riscv_vse64_v_f64m1(" in code
     assert "+= 4LL" in code
+
+
+def test_vlen128_lanes_and_header():
+    f, g = fields("f, g: float64[2D]")
+    ker = ps.create_kernel([Assignment(g.center(), f.center())], rvv_config(target=Target.RISCV_RVV128))
+    #   rvv_vlen128.hpp tells rvv.hpp the VLEN (its guard and the reduction lane counts)
+    assert '"pystencils_runtime/rvv_vlen128.hpp"' in ker.required_headers
+    assert '"pystencils_runtime/rvv.hpp"' not in ker.required_headers
+    code = ker.get_c_code()
+    #   the same intrinsics, 2 x f64 per iteration
+    assert "__riscv_vle64_v_f64m1(" in code and "2uLL)" in code
+    assert "+= 2LL" in code
+
+
+@pytest.mark.parametrize(
+    "target, dtype, lmul, sfx, lanes",
+    [
+        (Target.RISCV_RVV128, "float64", 2, "f64m2", 4),
+        (Target.RISCV_RVV128, "float32", 4, "f32m4", 16),
+        (Target.RISCV_RVV256, "float64", 2, "f64m2", 8),
+        (Target.RISCV_RVV256, "float32", 1, "f32m1", 8),
+    ],
+)
+def test_lmul_groups_registers(target, dtype, lmul, sfx, lanes):
+    a, b = fields(f"a, b: {dtype}[2D]")
+    code = rvv_code([Assignment(b.center(), 2 * a.center() + a[1, 0])], rvv_config(dtype, target, lmul))
+    assert f"__riscv_vle{dtype[-2:]}_v_{sfx}(" in code
+    assert f"{lanes}uLL)" in code and f"+= {lanes}LL" in code
+
+
+def test_lmul_casts_use_wider_and_narrower_groups():
+    #   f64 at LMUL 2 (VLEN 128, 4 lanes): the f32 half is one register, m1
+    d = fields("d: float64[1D]")
+    s = fields("s: float32[1D]")
+    code = rvv_code([Assignment(d.center(), tcast(s.center(), "float64"))], rvv_config("float64", Target.RISCV_RVV128, 2))
+    assert "__riscv_vfwcvt_f_f_v_f64m2(" in code
+    assert "__riscv_vle32_v_f32m1(" in code
+
+
+@pytest.mark.parametrize(
+    "target, lmul, lanes, error",
+    [
+        (Target.RISCV_RVV, 3, None, "must be 1, 2 or 4"),
+        (Target.RISCV_RVV, 2, 8, "not both"),
+        (Target.X86_AVX, 2, None, "needs a RISC-V Vector target"),
+    ],
+)
+def test_lmul_errors(target, lmul, lanes, error):
+    f, g = fields("f, g: float64[2D]")
+    cfg = rvv_config(target=target, lmul=lmul)
+    if lanes is not None:
+        cfg.cpu.vectorize.lanes = lanes
+    with pytest.raises(ValueError, match=error):
+        ps.create_kernel([Assignment(g.center(), f.center())], cfg)
 
 
 #   -------------------------------------------------------------------------------------
@@ -411,6 +488,11 @@ def test_philox(dtype, func, tuple_type, vget):
     assert f"{vget}(" in code
 
 
+def test_philox_needs_lmul1():
+    with pytest.raises(MaterializationError, match="rvv_lmul"):
+        rvv_code(philox_asms("float32"), rvv_config("float32", lmul=2, index_dtype="int32"))
+
+
 #   -------------------------------------------------------------------------------------
 #   Compile the generated code with a RISC-V compiler (if available)
 #   -------------------------------------------------------------------------------------
@@ -422,8 +504,12 @@ def _riscv_cxx() -> str | None:
     return shutil.which("riscv64-linux-gnu-g++")
 
 
-def _compile_kernels():
+def _compile_kernels(target=Target.RISCV_RVV, lmul=None):
     """A handful of kernels covering every code path of the RVV selector."""
+
+    def rvv_config(default_dtype="float64", **kwargs):
+        return globals()["rvv_config"](default_dtype, target, lmul, **kwargs)
+
     a, b, c = fields("a, b, c: float64[2D]")
     s32 = fields("s32: float32[1D]")
     i32 = fields("i32: int32[1D]")
@@ -453,15 +539,24 @@ def _compile_kernels():
     }
 
 
-@pytest.mark.parametrize("name", list(_compile_kernels().keys()))
-def test_generated_code_compiles(name):
+#   Every kernel at the default target and LMUL; the VLEN-128 target and LMUL 2 for all but Philox
+_COMPILE_CASES = [(name, Target.RISCV_RVV, None) for name in _compile_kernels()] + [
+    (name, target, lmul)
+    for target, lmul in [(Target.RISCV_RVV128, None), (Target.RISCV_RVV128, 2), (Target.RISCV_RVV256, 2)]
+    for name in _compile_kernels()
+    if lmul is None or not name.startswith("philox")
+]
+
+
+@pytest.mark.parametrize("name, target, lmul", _COMPILE_CASES)
+def test_generated_code_compiles(name, target, lmul):
     cxx = _riscv_cxx()
     if cxx is None:
         pytest.skip("no RISC-V C++ compiler available")
 
     from pystencils.include import get_pystencils_include_path
 
-    asms, cfg = _compile_kernels()[name]
+    asms, cfg = _compile_kernels(target, lmul)[name]
     ker = ps.create_kernel(asms, cfg)
     source = "\n".join(
         [f"#include {h}" for h in sorted(ker.required_headers)]
@@ -469,7 +564,7 @@ def test_generated_code_compiles(name):
     )
 
     cmd = [
-        cxx, "-std=c++17", "-fsyntax-only", "-march=rv64gcv_zvl256b",
+        cxx, "-std=c++17", "-fsyntax-only", f"-march=rv64gcv_zvl{target.rvv_vlen()}b",
         f"-I{get_pystencils_include_path()}", "-x", "c++", "-",
     ]
     result = subprocess.run(cmd, input=source, capture_output=True, text=True)

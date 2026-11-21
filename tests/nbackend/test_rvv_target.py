@@ -1,4 +1,4 @@
-"""Target, detection and JIT-flag tests for `Target.RISCV_RVV` (VLS, VLEN = 256).
+"""Target, detection and JIT-flag tests for the RVV targets (VLS, VLEN 256 and 128).
 
 Pure Python -- these run on any host.
 """
@@ -26,6 +26,17 @@ def test_target_flags():
     assert not t.is_gpu()
     assert Target._RVV in t and Target._RISCV in t
     assert Target._X86 not in t and Target._ARM not in t
+
+
+def test_vlen_targets():
+    #   RISCV_RVV is an alias of the VLEN-256 target; both RVV targets are vector CPU targets
+    assert Target.RISCV_RVV is Target.RISCV_RVV256
+    assert Target["RISCV_RVV"] is Target.RISCV_RVV256
+    assert Target.RISCV_RVV128 != Target.RISCV_RVV256
+    assert Target.RISCV_RVV128.is_vector_cpu() and Target._RVV in Target.RISCV_RVV128
+    assert (Target.RISCV_RVV256.rvv_vlen(), Target.RISCV_RVV128.rvv_vlen()) == (256, 128)
+    with pytest.raises(ValueError):
+        Target.X86_AVX.rvv_vlen()
 
 
 @pytest.mark.parametrize(
@@ -57,6 +68,14 @@ def test_default_lanes_like_avx(dtype, lanes):
     assert Target.X86_AVX.default_vector_lanes(dtype) == lanes
 
 
+@pytest.mark.parametrize(
+    "dtype, lanes", [(Fp(64), 2), (Fp(32), 4), (SInt(64), 2), (SInt(32), 4), (SInt(16), 8)]
+)
+def test_default_lanes_vlen128_like_sse(dtype, lanes):
+    assert Target.RISCV_RVV128.default_vector_lanes(dtype) == lanes
+    assert Target.X86_SSE.default_vector_lanes(dtype) == lanes
+
+
 @pytest.mark.parametrize("info_cls", [GccInfo, ClangInfo])
 def test_jit_flags(info_cls):
     flags = info_cls(target=Target.RISCV_RVV).cxxflags()
@@ -64,6 +83,11 @@ def test_jit_flags(info_cls):
     #   -mrvv-vector-bits would make the compiler assume VLEN == 256 exactly; we only
     #   assume VLEN >= 256.
     assert not any(f.startswith("-mrvv-vector-bits") for f in flags)
+
+
+@pytest.mark.parametrize("info_cls", [GccInfo, ClangInfo])
+def test_jit_flags_vlen128(info_cls):
+    assert "-march=rv64gcv_zvl128b" in info_cls(target=Target.RISCV_RVV128).cxxflags()
 
 
 def test_current_cpu_march_on_riscv(monkeypatch):

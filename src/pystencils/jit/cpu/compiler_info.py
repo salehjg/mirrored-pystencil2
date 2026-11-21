@@ -8,9 +8,10 @@ from typing import Sequence
 
 from ...codegen.target import Target
 
-#   The RVV backend hardcodes VLEN = 256 (SpacemiT K1). `zvl256b` tells the compiler
-#   the same thing (VLEN >= 256), and is what `pystencils_runtime/rvv.hpp` checks for.
-_RISCV_RVV_MARCH = "-march=rv64gcv_zvl256b"
+def _rvv_march(target: Target) -> str:
+    """``-march`` flag of an RVV target: ``zvl<VLEN>b`` tells the compiler that VLEN is at least the
+    target's VLEN, which is what `pystencils_runtime/rvv.hpp` checks for."""
+    return f"-march=rv64gcv_zvl{target.rvv_vlen()}b"
 
 
 def _current_cpu_march() -> list[str]:
@@ -24,7 +25,7 @@ def _current_cpu_march() -> list[str]:
 
     if platform.machine() == "riscv64":
         if Target.RISCV_RVV in Target.available_vector_cpu_targets():
-            return [_RISCV_RVV_MARCH]
+            return [_rvv_march(Target.RISCV_RVV)]
         return ["-march=rv64gc"]
 
     return ["-march=native"]
@@ -143,8 +144,8 @@ class _GnuLikeCliCompiler(CompilerInfo):
                 flags += ["-march=armv8.2-a+fp16"]
             case Target.ARM_SVE:
                 flags += ["-march=armv8.2-a+sve"]
-            case Target.RISCV_RVV:
-                flags += [_RISCV_RVV_MARCH]
+            case target if Target._RVV in target:
+                flags += [_rvv_march(target)]
 
         return flags + self.extra_cxxflags
 
